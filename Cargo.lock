@@ -328,6 +328,7 @@ name = "mmapzstd"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "memmap2",
  "rand",
  "tempfile",
