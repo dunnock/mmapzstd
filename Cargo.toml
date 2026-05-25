@@ -1,0 +1,19 @@
+[package]
+name = "mmapzstd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "mmap-backed zstd decompressor with backpressure"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "mmapzstd"
+path = "src/lib.rs"
+
+[dependencies]
+memmap2 = "0.9.10"
+zstd = "0.13.3"
+
+[dev-dependencies]
+criterion = "0.8.2"
+tempfile = "3.27.0"
