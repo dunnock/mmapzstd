@@ -1,5 +1,35 @@
 # Benchmark Results: mmapzstd vs zstd+BufReader
 
+## Cycle 03 Results (H3 hugepage variants)
+
+**Task:** `hugepage-mmap` | **Worktree:** `/work/mmapzstd/.worktrees/03-hugepages`
+**Fixture:** `/work/cargo-target-ralph/mmapzstd-fixtures/decompress_256mib.zst` (ext4, 128.5 MiB)
+
+| Implementation | Run 1 | Run 2 | Run 3 | Mean | Throughput |
+|---|---|---|---|---|---|
+| `mmapzstd::Decoder` (H3a, ext4) | 31.72 ms | 31.73 ms | 31.54 ms | **31.66 ms** | **8,076 MB/s** |
+| `zstd+BufReader` (baseline) | 30.30 ms | 30.18 ms | 29.61 ms | **30.03 ms** | **8,526 MB/s** |
+
+Gap: mmap is **−5.4%** vs baseline. Essentially unchanged from cycle-02 (−5%).
+
+**H3b** (MAP_HUGETLB anon): **Skipped** — `HugePages_Free=0`  
+**H3c** (memfd_create MFD_HUGETLB): **Skipped** — same
+
+Key finding from smaps inspection: `THPeligible: 0` for the file mmap VMA.
+`MADV_HUGEPAGE` does not enable THP for read-only file-backed `MAP_PRIVATE`
+mappings in Linux 6.17 (`hugepages-2048kB/enabled = [inherit]` of global
+`madvise` applies only to anonymous mappings). `FilePmdMapped: 0` confirmed.
+
+**Outcome: no_winner.** H3b/H3c pending operator action (`sudo sysctl vm.nr_hugepages=160`).
+See escalation: `/work/ralph-self-improvement/workspace/.escalations/cycle03-hugepages-setup.md`
+
+**Changes in this cycle:**
+- `Decoder::from_slice(&[u8])` constructor added (H3b/H3c bench variant)
+- Bench fixture moved from `NamedTempFile` (tmpfs) to persistent ext4 path
+- `examples/measure_mmap_hugepage.rs` added (smaps inspector + H3b/H3c probes)
+
+---
+
 ## Cycle 02-perf Results (H1 + H2 optimisations)
 
 | Implementation | Criterion median | 95% CI | Throughput (median) | vs cycle-01 |

@@ -4,12 +4,26 @@ use std::path::Path;
 use memmap2::{Mmap, MmapOptions};
 use zstd::stream::raw::{Decoder as ZstdDecoder, Operation};
 
+enum DecoderBuf<'a> {
+    Mmap(Mmap),
+    Slice(&'a [u8]),
+}
+
+impl<'a> std::ops::Deref for DecoderBuf<'a> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            DecoderBuf::Mmap(m) => m,
+            DecoderBuf::Slice(s) => s,
+        }
+    }
+}
+
 pub struct Decoder<'a> {
-    mmap: Mmap,
+    buf: DecoderBuf<'a>,
     in_pos: usize,
     retire_pos: usize,
     zstd: ZstdDecoder<'static>,
-    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl Decoder<'static> {
@@ -26,11 +40,24 @@ impl Decoder<'static> {
         apply_madvise(&mmap)?;
         let zstd = ZstdDecoder::new()?;
         Ok(Decoder {
-            mmap,
+            buf: DecoderBuf::Mmap(mmap),
             in_pos: 0,
             retire_pos: 0,
             zstd,
-            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+impl<'a> Decoder<'a> {
+    /// Borrow compressed data from `data` without mapping; no madvise hints.
+    /// The caller controls the backing memory (e.g., a hugepage allocation).
+    pub fn from_slice(data: &'a [u8]) -> io::Result<Self> {
+        let zstd = ZstdDecoder::new()?;
+        Ok(Decoder {
+            buf: DecoderBuf::Slice(data),
+            in_pos: 0,
+            retire_pos: 0,
+            zstd,
         })
     }
 }
@@ -40,22 +67,27 @@ const RETIRE_WINDOW: usize = 4 * 1024 * 1024; // 4 MiB trailing window before re
 impl<'a> Decoder<'a> {
     #[cfg(target_os = "linux")]
     fn maybe_retire(&mut self) {
+        if !matches!(self.buf, DecoderBuf::Mmap(_)) {
+            return;
+        }
         let new_frontier = self.in_pos.saturating_sub(RETIRE_WINDOW);
         let new_frontier = new_frontier & !(4096 - 1); // align down to page boundary
         if new_frontier > self.retire_pos {
-            // SAFETY: We only retire pages we have already consumed (before
-            // in_pos - RETIRE_WINDOW). The zstd compressed-input cursor is
-            // strictly monotonically increasing, so no future read will touch
-            // these bytes again. MADV_DONTNEED on a read-only file mapping
-            // simply lets the kernel reclaim pages; re-faults would reload
-            // from the file, but they won't happen here.
-            let _ = unsafe {
-                self.mmap.unchecked_advise_range(
-                    memmap2::UncheckedAdvice::DontNeed,
-                    self.retire_pos,
-                    new_frontier - self.retire_pos,
-                )
-            };
+            if let DecoderBuf::Mmap(mmap) = &self.buf {
+                // SAFETY: We only retire pages we have already consumed (before
+                // in_pos - RETIRE_WINDOW). The zstd compressed-input cursor is
+                // strictly monotonically increasing, so no future read will touch
+                // these bytes again. MADV_DONTNEED on a read-only file mapping
+                // simply lets the kernel reclaim pages; re-faults would reload
+                // from the file, but they won't happen here.
+                let _ = unsafe {
+                    mmap.unchecked_advise_range(
+                        memmap2::UncheckedAdvice::DontNeed,
+                        self.retire_pos,
+                        new_frontier - self.retire_pos,
+                    )
+                };
+            }
             self.retire_pos = new_frontier;
         }
     }
@@ -73,7 +105,7 @@ impl<'a> io::Read for Decoder<'a> {
         // Decode directly into the caller's buffer. ZSTD_decompressStream
         // handles any output-buffer size and picks up where it left off next
         // call, so no intermediate staging buffer is needed.
-        let input = &self.mmap[self.in_pos..];
+        let input = &self.buf[self.in_pos..];
         let status = self
             .zstd
             .run_on_buffers(input, buf)
@@ -96,7 +128,7 @@ fn apply_madvise(mmap: &Mmap) -> io::Result<()> {
             mmap.advise(Advice::HugePage)?;
             // Pre-fault all page-table entries in batch so that minor faults
             // are paid once here rather than scattered across the decode loop.
-            // This also benefits callers that use from_mmap() where MAP_POPULATE
+            // Also benefits callers that use from_mmap() where MAP_POPULATE
             // was not set at creation time. Silently ignored on < 5.14 kernels.
             let _ = mmap.advise(Advice::PopulateRead);
         }
@@ -124,6 +156,18 @@ mod tests {
         let f = compressed_tempfile(&data);
 
         let mut dec = Decoder::open(f.path()).expect("open");
+        let mut got = Vec::new();
+        dec.read_to_end(&mut got).expect("read_to_end");
+
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn round_trip_from_slice() {
+        let data: Vec<u8> = (0u16..1024).map(|i| (i % 251) as u8).collect();
+        let compressed = zstd::encode_all(data.as_slice(), 0).expect("encode_all");
+
+        let mut dec = Decoder::from_slice(&compressed).expect("from_slice");
         let mut got = Vec::new();
         dec.read_to_end(&mut got).expect("read_to_end");
 

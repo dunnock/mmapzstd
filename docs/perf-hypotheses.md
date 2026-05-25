@@ -160,7 +160,96 @@ Not tested — blocked by system configuration:
 
 H3 is the most promising remaining hypothesis for closing the gap (estimated 15-20%). It requires operator action: `echo madvise > /sys/kernel/mm/transparent_hugepage/shmem_enabled` OR `sysctl vm.nr_hugepages=128`.
 
-**Status: not-tested — blocked by THP policy. Requires operator escalation.**
+**Status (cycle 02-perf): not-tested — blocked by THP policy. Requires operator escalation.**
+
+---
+
+## Hypothesis 3 — Cycle 03 Results
+
+**Cycle-03 task:** `hugepage-mmap`
+**Worktree:** `/work/mmapzstd/.worktrees/03-hugepages`
+**Fixture:** `/work/cargo-target-ralph/mmapzstd-fixtures/decompress_256mib.zst` (ext4 bind-mount, 128.5 MiB)
+
+### H3a — ext4 fixture + `MADV_HUGEPAGE` + `MADV_POPULATE_READ`
+
+The bench fixture was moved from `tempfile::NamedTempFile` (tmpfs, `shmem_enabled=never`)
+to a persistent file on `/work` (ext4 bind-mount, `FileHugePages: 4.5 GiB` system-wide).
+`MADV_HUGEPAGE` and `MADV_POPULATE_READ` were already in `apply_madvise()`.
+
+**smaps inspection** (via `examples/measure_mmap_hugepage.rs`):
+
+```
+FilePmdMapped:   0 kB   (no 2 MiB file-backed huge pages in user page table)
+AnonHugePages:   0 kB   (expected — file-backed mmap)
+THPeligible:     0      (kernel marks this VMA ineligible for THP)
+```
+
+`THPeligible: 0` means khugepaged will not promote this mapping. Root cause:
+`MADV_HUGEPAGE` on a read-only file-backed `MAP_PRIVATE` mapping does not set
+`VM_HUGEPAGE` on the VMA in Linux 6.17 — the kernel's `madvise_hugepage` path
+silently skips file VMAs that are not shmem/tmpfs. The `FileHugePages: 4.5 GiB`
+system-wide total comes from other processes whose file pages were promoted by a
+different path (page-cache large-folio allocation), not from user-space hints.
+
+**Criterion results (3 runs, 10 samples each, 30 s measurement):**
+
+| Run | mmapzstd median | baseline median |
+|-----|----------------|----------------|
+| 1   | 31.72 ms       | 30.30 ms       |
+| 2   | 31.73 ms       | 30.18 ms       |
+| 3   | 31.54 ms       | 29.61 ms       |
+
+**H3a median: ~31.66 ms → ~8,076 MB/s. No improvement vs cycle-02 (8,215 MB/s).**
+The fixture-on-ext4 change does not affect performance because THP is not active.
+
+**Status: tested — no winner (THP ineligible on read-only file mmap).**
+
+---
+
+### H3b — Anon `MAP_HUGETLB | MAP_HUGE_2MB`
+
+Attempted: `mmap(MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB | (21<<26))` sized to
+the compressed fixture (~130 MiB, aligned to 2 MiB).
+
+```
+errno=12 (ENOMEM)
+HugePages_Total: 0 / HugePages_Free: 0
+```
+
+**Status: Skipped — hugepages not reserved. Escalation filed:**
+`/work/ralph-self-improvement/workspace/.escalations/cycle03-hugepages-setup.md`
+Operator command: `sudo sysctl vm.nr_hugepages=160`.
+
+The `Decoder::from_slice` constructor was added to `src/decoder.rs` for this variant.
+When huge pages are reserved, the bench group `h3b_hugepage_anon` will activate.
+
+---
+
+### H3c — `memfd_create(MFD_HUGETLB | MFD_HUGE_2MB)`
+
+Attempted: `syscall(SYS_memfd_create, "mmapzstd-hugetlb", MFD_HUGETLB|(21<<26))`,
+then `ftruncate` + `mmap(MAP_SHARED)`.
+
+```
+ftruncate: ok
+mmap of memfd: errno=12 (ENOMEM) — same root cause as H3b
+```
+
+**Status: Skipped — hugepages not reserved (same escalation as H3b).**
+
+---
+
+### Cycle-03 Summary
+
+| Variant | Status | Throughput | vs cycle-02 |
+|---------|--------|-----------|-------------|
+| H3a: ext4 + MADV_HUGEPAGE | Tested — no winner | ~8,076 MB/s | −1.7% (noise) |
+| H3b: MAP_HUGETLB anon | Skipped: HugePages_Free=0 | — | — |
+| H3c: memfd_create MFD_HUGETLB | Skipped: HugePages_Free=0 | — | — |
+
+**Outcome: no_winner.** The ext4 fixture change does not trigger THP (THPeligible=0
+on read-only file mmap). H3b/H3c require operator pre-action (`nr_hugepages=160`).
+Escalation filed for operator to reserve huge pages and re-run.
 
 ---
 
