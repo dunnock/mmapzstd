@@ -7,7 +7,6 @@ use zstd::stream::raw::{Decoder as ZstdDecoder, Operation};
 pub struct Decoder<'a> {
     mmap: Mmap,
     in_pos: usize,
-    #[allow(dead_code)] // used by page-retire task
     retire_pos: usize,
     zstd: ZstdDecoder<'static>,
     overflow: Vec<u8>,
@@ -38,8 +37,35 @@ impl Decoder<'static> {
     }
 }
 
-// Zstd output blocks are at most ~128 KiB.
-const BLOCK_SIZE: usize = 128 * 1024;
+const BLOCK_SIZE: usize = 128 * 1024; // zstd output blocks are at most ~128 KiB
+const RETIRE_WINDOW: usize = 4 * 1024 * 1024; // 4 MiB trailing window before retirement
+
+impl<'a> Decoder<'a> {
+    #[cfg(target_os = "linux")]
+    fn maybe_retire(&mut self) {
+        let new_frontier = self.in_pos.saturating_sub(RETIRE_WINDOW);
+        let new_frontier = new_frontier & !(4096 - 1); // align down to page boundary
+        if new_frontier > self.retire_pos {
+            // SAFETY: We only retire pages we have already consumed (before
+            // in_pos - RETIRE_WINDOW). The zstd compressed-input cursor is
+            // strictly monotonically increasing, so no future read will touch
+            // these bytes again. MADV_DONTNEED on a read-only file mapping
+            // simply lets the kernel reclaim pages; re-faults would reload
+            // from the file, but they won't happen here.
+            let _ = unsafe {
+                self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    self.retire_pos,
+                    new_frontier - self.retire_pos,
+                )
+            };
+            self.retire_pos = new_frontier;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn maybe_retire(&mut self) {}
+}
 
 impl<'a> io::Read for Decoder<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -72,6 +98,7 @@ impl<'a> io::Read for Decoder<'a> {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         self.in_pos += status.bytes_read;
+        self.maybe_retire();
         self.overflow.truncate(status.bytes_written);
         self.overflow_start = 0;
 
@@ -127,6 +154,36 @@ mod tests {
         dec.read_to_end(&mut got).expect("read_to_end");
 
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn retire_pos_advances_after_large_read() {
+        // Use poorly-compressible (LCG pseudo-random) data so the compressed
+        // file is > RETIRE_WINDOW (4 MiB), ensuring madvise is actually called.
+        let data: Vec<u8> = (0u32..10 * 1024 * 1024 / 4)
+            .flat_map(|i| {
+                i.wrapping_mul(1664525)
+                    .wrapping_add(1013904223)
+                    .to_le_bytes()
+            })
+            .collect();
+        let compressed = zstd::encode_all(data.as_slice(), 3).expect("encode_all");
+        let compressed_len = compressed.len();
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        use std::io::Write;
+        tmp.write_all(&compressed).expect("write");
+
+        let mut dec = Decoder::open(tmp.path()).expect("open");
+        let mut got = Vec::with_capacity(data.len());
+        dec.read_to_end(&mut got).expect("read_to_end");
+        assert_eq!(got, data);
+
+        // Retirement only fires when the compressed input exceeds RETIRE_WINDOW.
+        if compressed_len > RETIRE_WINDOW {
+            #[cfg(target_os = "linux")]
+            assert!(dec.retire_pos > 0, "retire_pos should advance on linux");
+        }
     }
 
     #[test]
