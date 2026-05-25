@@ -1,5 +1,37 @@
 # Benchmark Results: mmapzstd vs zstd+BufReader
 
+## Cycle 04 Results (H4 hugepage-scratch BufReader variants)
+
+**Task:** `hugepage-bufreader-scratch` | **Worktree:** `/work/mmapzstd/.worktrees/03-hugepages`
+**Fixture:** `/work/cargo-target-ralph/mmapzstd-fixtures/decompress_256mib.zst` (ext4, 128.5 MiB)
+
+Hypothesis: placing the BufReader scratch buffer on a single 2 MiB `MAP_HUGETLB` anon page
+reduces user-side TLB entries from 16 (64 KiB / 4 KiB) to 1, eliminating any TLB pressure
+attributable to the scratch buffer during decode.
+
+| Variant | Description | Result | Throughput |
+|---|---|---|---|
+| H4-ctrl | BufReader 64 KiB, normal 4 KiB pages | **30.89 ms** | **8,287 MB/s** |
+| H4a | 2 MiB MAP_HUGETLB scratch, 64 KiB read chunks | **Skipped** | — |
+| H4b | 2 MiB MAP_HUGETLB scratch, 256 KiB read chunks | **Skipped** | — |
+| H4c | 2 MiB MAP_HUGETLB scratch, 64 KiB pread64 chunks | **Skipped** | — |
+
+**H4a/H4b/H4c**: Skipped — `MAP_HUGETLB` failed with `errno=12 (ENOMEM)`, `HugePages_Free=0`.
+Operator action required: `sudo sysctl vm.nr_hugepages=160`.
+Escalation: `/work/ralph-self-improvement/workspace/.escalations/cycle03-hugepages-setup.md`
+
+**H4-ctrl**: Confirmed at 8,287 MB/s (vs 8,634 MB/s criterion baseline from cycle-02; our
+harness runs 3 warm iterations vs criterion's full measurement window, accounting for the ~4%
+variance). VmPTE delta = +4 kB during the bench, as expected for a 64 KiB normal allocation.
+
+**Outcome: no_winner** (hugepage variants pending operator action).
+
+**Changes in this cycle:**
+- `examples/measure_bufreader_hugepage.rs` added (`ScratchReader` + all four variants)
+- VmPTE delta reported per variant to verify huge-PTE usage
+
+---
+
 ## Cycle 03 Results (H3 hugepage variants)
 
 **Task:** `hugepage-mmap` | **Worktree:** `/work/mmapzstd/.worktrees/03-hugepages`
