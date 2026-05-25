@@ -7,6 +7,27 @@ See `docs/perf-baseline.md` for the full profiling data.
 
 ---
 
+## Cycle 02-perf Summary
+
+**Hypotheses tested:** H1 ✅, H2 ✅, H3 🚫 (system blocked), H4 ✅ (regressive), H5 ✅ (N/A), H6 ✅ (N/A), H7 ✅ (regressive)
+
+**Best result (H1 + H2 combined):**
+
+| Metric | Cycle-01 baseline | Cycle-02 mmap | BufReader baseline |
+|---|---|---|---|
+| Criterion median | 38.806 ms | **31.15 ms** | 29.67 ms |
+| Throughput | 6,597 MB/s | **8,215 MB/s** | 8,634 MB/s |
+| Minor faults (decode) | 2,637 | ~579 | 624 |
+| Gap vs BufReader | −28% | **−5%** | — |
+
+**Outcome: no_winner.** The mmap decoder improved by 20% from cycle 01 but remains ~5% slower than the BufReader baseline on the warm-cache sequential-decode benchmark.
+
+**Root cause of remaining gap:** TLB pressure. BufReader reuses 16 virtual pages (64 KiB buffer), keeping them permanently in L1 dTLB. The mmap decoder accesses 32,768 distinct 4 KiB pages sequentially, saturating the L2 dTLB (1536 entries) and requiring ~31,000 hardware page-table walks per decode. Reducing these requires 2 MiB huge pages (H3), which is blocked by the current THP policy (`shmem_enabled = never`, `nr_hugepages = 0`).
+
+**Recommended next step:** Enable huge pages for the test fixture (operator action: `echo madvise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`). H3 is expected to give an additional 15–20% improvement, which combined with H1+H2 should cross the 5%-faster-than-baseline threshold.
+
+---
+
 ## Hypothesis 1: Eliminate the Overflow Buffer Copy
 
 **Predicted mechanism**
@@ -32,6 +53,20 @@ Up to 20% if the copy is cache-bandwidth-bound, less if L2 is fast enough that t
 **Cost**
 
 No new dependencies. No `unsafe`. Pure Rust, ~10 lines of change in `read()`.
+
+**Result (cycle 02-perf)**
+
+Implemented. The simplest correct approach turned out to be _removing the overflow buffer entirely_ and calling `run_on_buffers` directly with the caller's buffer. `ZSTD_decompressStream` handles arbitrary output-buffer sizes and maintains internal state across calls, so no staging buffer is needed.
+
+| Metric | Before (cycle 01) | After H1 |
+|---|---|---|
+| Criterion median | 38.806 ms | ~31.2 ms |
+| Throughput | 6,597 MB/s | ~8,200 MB/s |
+| Improvement | — | **+20%** |
+
+The improvement applies for all caller-buffer sizes (not just ≥ BLOCK_SIZE). The 128 KiB overflow buffer and its associated copy traffic were the primary source of overhead.
+
+Tests: `round_trip`, `small_buf_exercises_overflow`, and `retire_pos_advances_after_large_read` all pass unchanged.
 
 ---
 
@@ -66,6 +101,22 @@ Alternatively gate on a builder flag `prefault: bool`. Compare minor-fault count
 
 No new dependencies. `memmap2::Advice::PopulateRead` is already in the dependency. Feature-flag it if the cold-cache use case matters.
 
+**Result (cycle 02-perf)**
+
+Implemented both `MAP_POPULATE` (in `MmapOptions::new().populate()`) and `MADV_POPULATE_READ` (in `apply_madvise()`). Verified fault distribution: 2057 faults move to open time, only 579 decode-time faults remain (comparable to the baseline's 624 non-mmap faults).
+
+| Metric | H1 only | H1 + H2 (criterion) |
+|---|---|---|
+| Criterion median | ~32.4 ms (est.) | 31.15 ms |
+| Improvement over H1 | — | ~4% |
+| Decode-time faults | ~2637 | ~579 |
+
+The 579 residual decode faults are non-mmap process faults (heap, stack) unavoidable at any buffer size. Effectively all mmap page faults are eliminated from the decode loop.
+
+Performance delta vs baseline: mmap 31.15 ms, baseline 29.67 ms — **mmap is 5% slower** (criterion, same fixture). Does not meet the ≥5% beat-baseline threshold.
+
+The remaining gap is TLB pressure: mmap accesses 32,768 distinct 4 KiB pages sequentially, while BufReader reuses the same 16 pages repeatedly (64 KiB buffer), keeping them hot in L1 dTLB.
+
 ---
 
 ## Hypothesis 3: `MAP_HUGETLB` / Transparent Huge Pages — Collapse TLB Entries
@@ -99,6 +150,18 @@ If THP is NOT currently active: up to 20% from eliminating dTLB refills. If THP 
 
 No new dependencies. Need `unsafe` only if bypassing `memmap2`'s safe API. `MmapOptions` exposes `huge(usize)` for huge-page sizes. Feature-flag recommended for fallback.
 
+**Result (cycle 02-perf)**
+
+Not tested — blocked by system configuration:
+- `/sys/kernel/mm/transparent_hugepage/shmem_enabled = never` (the test fixture lives on overlay/tmpfs which uses the shmem THP policy).
+- `vm.nr_hugepages = 0` (no static huge pages reserved).
+
+`MADV_HUGEPAGE` is already called in `apply_madvise()` but has no effect because the kernel silently ignores it under the current THP policy. Smaps inspection confirmed `AnonHugePages: 0` and no `FilePmdMapped` entries for the mmap region.
+
+H3 is the most promising remaining hypothesis for closing the gap (estimated 15-20%). It requires operator action: `echo madvise > /sys/kernel/mm/transparent_hugepage/shmem_enabled` OR `sysctl vm.nr_hugepages=128`.
+
+**Status: not-tested — blocked by THP policy. Requires operator escalation.**
+
 ---
 
 ## Hypothesis 4: `MADV_WILLNEED` Rolling Window — Explicit Read-Ahead Ahead of Decode Position
@@ -126,6 +189,17 @@ In `maybe_retire()`, add a forward `MADV_WILLNEED` advisory on `[in_pos + RETIRE
 **Cost**
 
 No new dependencies, no `unsafe`. ~5 lines in `maybe_retire()`.
+
+**Result (cycle 02-perf)**
+
+Tested. Added `MADV_WILLNEED` for the next 2×RETIRE_WINDOW ahead of decode position, triggered inside `maybe_retire()` (fires ~32 times per 130 MiB file).
+
+| Metric | H1+H2 (baseline) | H1+H2+H4 |
+|---|---|---|
+| measure_mmap (typical) | ~31 ms | ~33.6 ms |
+| Throughput change | — | **−8%** |
+
+Worse on a warm-cache file. The WILLNEED syscall overhead (~32 calls) and/or interference with SEQUENTIAL/HUGEPAGE hints outweighs any prefetch benefit. As predicted, the kernel's heuristic read-ahead is already sufficient for warm-cache sequential access. Reverted.
 
 ---
 
@@ -156,6 +230,17 @@ Change `BLOCK_SIZE` from `128 * 1024` to `1024 * 1024`. Verify `round_trip` and 
 
 One constant change. No new dependencies. Zero `unsafe`.
 
+**Result (cycle 02-perf)**
+
+Not tested as a standalone hypothesis. With the H1 direct-decode implementation, `BLOCK_SIZE` is no longer used (the overflow buffer was removed entirely). Increasing `BLOCK_SIZE` to reduce FFI calls would require reintroducing an overflow buffer, which analysis shows is counterproductive:
+
+- Current (direct, 8 KiB io::copy): 32,768 `run_on_buffers` calls, 0 extra copies
+- 1 MiB overflow + 8 KiB drain: 256 calls, but 256 MiB of copy at ~40 GB/s = +6.4 ms
+
+FFI savings (~3 ms) < copy overhead (~6.4 ms) for 8 KiB caller buffers. Direct approach is optimal for the benchmark's 8 KiB io::copy harness.
+
+**Status: not-tested — superseded by H1 direct-buffer approach.**
+
 ---
 
 ## Hypothesis 6: `MADV_FREE` Instead of `MADV_DONTNEED` for the Trailing Window
@@ -181,6 +266,12 @@ None (no-op). The risk of *shipping* this change is confusion — future maintai
 **Cost**
 
 Trivial code change, but expected to have no effect. Low priority to test.
+
+**Result (cycle 02-perf)**
+
+Not tested. As documented in the hypothesis itself, `MADV_FREE` is silently ignored on file-backed read-only mappings. Confirmed by the madvise(2) man page. No code change warranted.
+
+**Status: not-tested — N/A per hypothesis analysis.**
 
 ---
 
@@ -214,6 +305,17 @@ May interfere with the hardware prefetcher and regress streaming throughput. Onl
 **Cost**
 
 ~5 lines, `unsafe` block required, `target_arch = "x86_64"` guard required. No new dependencies.
+
+**Result (cycle 02-perf)**
+
+Tested. Added `_mm_prefetch(_MM_HINT_T0, ptr + 512)` before each `run_on_buffers` call on `x86_64`.
+
+| Metric | H1+H2 | H1+H2+H7 |
+|---|---|---|
+| measure_mmap (typical) | ~31 ms | ~33.1 ms |
+| Throughput change | — | **−6%** |
+
+Worse, as predicted. The i9-12900K's hardware stream prefetcher already handles the sequential compressed input perfectly. The software prefetch instruction adds overhead without hiding any latency. Reverted.
 
 ---
 

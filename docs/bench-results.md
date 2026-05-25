@@ -1,5 +1,22 @@
 # Benchmark Results: mmapzstd vs zstd+BufReader
 
+## Cycle 02-perf Results (H1 + H2 optimisations)
+
+| Implementation | Criterion median | 95% CI | Throughput (median) | vs cycle-01 |
+|---|---|---|---|---|
+| `mmapzstd::Decoder` | **31.15 ms** | [31.08 ms – 31.23 ms] | **8,215 MB/s** | +20% |
+| `zstd+BufReader` (baseline) | **29.67 ms** | [29.60 ms – 29.70 ms] | **8,634 MB/s** | − |
+
+The mmap decoder closed the gap from −28% to **−5%** vs the BufReader baseline.
+
+Optimisations applied in this cycle:
+1. **H1 — Eliminate overflow copy**: removed the 128 KiB staging buffer; `run_on_buffers` writes directly into the caller's buffer via the zstd streaming API.
+2. **H2 — MAP_POPULATE + MADV_POPULATE_READ**: pre-fault all page-table entries at `open()` time so minor faults are paid once in batch rather than scattered across the decode loop.
+
+See `docs/perf-hypotheses.md` for the full hypothesis catalogue and per-hypothesis results.
+
+---
+
 ## Environment
 
 | Item | Value |
