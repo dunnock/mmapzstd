@@ -70,3 +70,44 @@ file, staying in the same ballpark as the BufReader path's 5 MB. On workloads
 where the compressed input is larger than available RAM or where re-reading the
 same file repeatedly would fill the page cache, the mmap path's tighter memory
 footprint and elimination of double-buffering may tip the balance.
+
+---
+
+## Conclusion (cycle 02)
+
+**Best end-to-end zstd decompression recipe on this hardware (i9-12900K, Linux 6.17, warm cache):**
+
+```rust
+zstd::stream::Decoder::new(BufReader::with_capacity(65_536, File::open(path)?))
+```
+
+Throughput: **8,634 MB/s** (Criterion median, 256 MiB corpus, zstd level 3).
+
+Four BufReader optimisation hypotheses were evaluated in cycle 02 (see
+`docs/bufreader-hypotheses.md`):
+
+| Hypothesis | Result |
+|---|---|
+| H1: larger buffer (256 KiB – 4 MiB) | −6% to −10% — L2 cache eviction |
+| H2: `posix_fadvise(SEQ + WILLNEED)` | ≈0% — page cache already hot |
+| H3: `splice()` file → pipe → read | Not applicable — no user-copy savings |
+| H4: raw `File` (no `BufReader`) | ≈0% — zstd internal buffering equivalent |
+
+None of the hypotheses beat the 64 KiB BufReader baseline by the ≥5% threshold.
+The 64 KiB value sits at the L2 sweet spot: small enough to avoid evicting the
+zstd decoder's hot working set, large enough to absorb all syscall overhead.
+
+**The `mmapzstd::Decoder` is ~5% slower** than this recipe on the warm-cache
+sequential benchmark after two cycles of optimisation (H1: eliminate overflow
+copy, H2: batch pre-fault). The remaining gap is pure TLB pressure: the mmap
+path touches 32,768 distinct 4 KiB virtual pages per decode while BufReader
+reuses 16 pages (64 KiB buffer) permanently hot in L1 dTLB. Closing this gap
+requires 2 MiB transparent huge pages (H3 from `perf-hypotheses.md`), which
+is blocked by the system's THP policy (`shmem_enabled = never`,
+`nr_hugepages = 0`). That is an operator-level action; it is not included in
+this deliverable.
+
+The mmap path retains advantages for **cold-cache** and **memory-pressure**
+workloads: its sliding-window DONTNEED retirement keeps RSS to 9 MB vs 5 MB for
+BufReader, and it avoids page-cache thrashing when the compressed file is larger
+than available RAM.
