@@ -18,10 +18,10 @@ Throughput computed as 256 MiB ÷ median wall time.
 
 | Implementation | Median time | 95% CI | Throughput (median) | Throughput CI |
 |---|---|---|---|---|
-| `mmapzstd::Decoder` | 38.692 ms | [38.578 ms – 38.904 ms] | **6,614 MB/s** | 6,581–6,633 MB/s |
-| `zstd+BufReader` (baseline) | 30.194 ms | [29.912 ms – 30.655 ms] | **8,478 MB/s** | 8,350–8,558 MB/s |
+| `mmapzstd::Decoder` | 38.806 ms | [38.639 ms – 39.030 ms] | **6,597 MB/s** | 6,559–6,625 MB/s |
+| `zstd+BufReader` (baseline) | 30.345 ms | [30.290 ms – 30.396 ms] | **8,437 MB/s** | 8,423–8,452 MB/s |
 
-The baseline is ~22 % faster than the mmap decoder on this machine.
+The baseline is ~28 % faster than the mmap decoder on this machine.
 
 ## Page-Fault and RSS Comparison
 
@@ -31,7 +31,7 @@ not installed on this machine; shell `time` does not report fault counts.)
 
 | Metric | `mmapzstd::Decoder` | `zstd+BufReader` |
 |---|---|---|
-| Minor page faults | 2,667 | 623 |
+| Minor page faults | 2,666 | 624 |
 | Major page faults | 0 | 0 |
 | VmRSS after decode | 9.0 MB | 5.0 MB |
 
@@ -45,7 +45,7 @@ The baseline `zstd+BufReader` path is faster because zstd decompression is
 CPU-bound on modern hardware: the `read()` + kernel-copy overhead from a 64 KiB
 `BufReader` is negligible relative to codec work, and the kernel's sequential
 read-ahead keeps the pipe full. The mmap decoder pays a higher soft-fault cost
-(2,667 vs 623 minor faults) because each 4 KiB compressed page must be faulted
+(2,666 vs 624 minor faults) because each 4 KiB compressed page must be faulted
 into the TLB on first access, even with `MADV_SEQUENTIAL` hinting. The
 `MADV_DONTNEED` sliding-window retirement is working correctly — the mmap
 decoder's post-decode RSS is only 9 MB despite mapping a ~130 MB compressed
