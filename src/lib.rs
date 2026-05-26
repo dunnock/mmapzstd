@@ -10,14 +10,18 @@
 //!
 //! | Constructor | Platform | When to use |
 //! |-------------|----------|-------------|
-//! | [`decoder::Decoder::open_hugepage_memfd`] | Linux ≥ 4.14 | max throughput, hugepages reserved |
-//! | [`decoder::Decoder::open_hugepage`] | Linux ≥ 2.6.17 | max throughput, hugepages reserved |
+//! | [`decoder::Decoder::open_hugepage_memfd`] | Linux ≥ 4.14 | max throughput; file fits in hugepage pool |
+//! | [`decoder::Decoder::open_hugepage`] | Linux ≥ 2.6.17 | max throughput; file fits in hugepage pool |
+//! | [`decoder::Decoder::open_hugepage_streaming`] | Linux ≥ 2.6.17 | file exceeds hugepage pool; bounded 8 MiB hugepage RSS |
 //! | [`decoder::Decoder::from_mmap`] | all | caller controls mmap options; portable file-mmap path |
 //! | [`decoder::Decoder::from_slice`] | all | caller controls backing memory |
 //!
 //! Hugepage constructors require pre-reserved 2 MiB pages (`vm.nr_hugepages`).
 //! If unavailable they return `io::ErrorKind::OutOfMemory` — there is no silent
 //! fallback.  Reserve with `sudo sysctl vm.nr_hugepages=N` before calling them.
+//!
+//! `open_hugepage_streaming` only needs 4 reserved pages (8 MiB scratch) regardless
+//! of file size; use it when the compressed file is larger than the hugepage pool.
 //!
 //! Non-Linux callers or callers that want a portable low-RSS path should build
 //! a [`memmap2::Mmap`] and pass it through [`decoder::Decoder::from_mmap`].

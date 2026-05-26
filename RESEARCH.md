@@ -646,5 +646,117 @@ decode cursor are retained before `MADV_DONTNEED` is issued.  This value exceeds
 zstd streaming decoder's compressed-input look-behind (which is zero: compressed input
 is consumed monotonically), making the retirement safe in all cases.
 
-13. Intel — "12th Generation Intel Core Processor Family Datasheet, Vol. 1":
-    <https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>
+---
+
+## Cycle 07 — Streaming Hugepage Decode (S3 Algorithm)
+
+*2026-05-26 — mmapzstd 0.3.0*
+
+### Algorithm
+
+The S3 streaming algorithm introduces `Decoder::open_hugepage_streaming(path, window)`:
+
+- The source file is mmapped at 4 KiB granularity (no MAP_POPULATE, lazy faults).
+- A `window`-byte (default 8 MiB = 4 hugepages) `MAP_HUGETLB | MAP_HUGE_2MB` scratch
+  is allocated once at construction time.
+- The decode loop refills the scratch from the source mmap in `window`-byte chunks, then
+  invokes the zstd streaming decoder exclusively from the hugepage scratch.
+- The source mmap is retired (`MADV_DONTNEED`) one scratch-width behind the read cursor.
+- Hugepage RSS is bounded to `window` bytes regardless of corpus size.
+
+### Motivation
+
+`open_hugepage_memfd` (the cycle-06 winner at +15% over BufReader) requires loading the
+entire compressed file into hugepage memory.  For the i9-12900K test system with
+160 × 2 MiB = 320 MiB of reserved pages, this limits hugepage-backed decoding to
+files ≤ 320 MiB compressed.  A 1 GiB compressed file requires 514 hugepages — more
+than the pool.  S3 was designed to preserve the dTLB win of H3c while bounding
+hugepage consumption to a fixed scratch size.
+
+### Key bench numbers (cycle 07)
+
+**256 MiB decompressed corpus (128.5 MiB compressed), warm cache, Criterion medians:**
+
+| Mode | Throughput (MB/s) | Hugepage RSS |
+|------|------------------:|-------------:|
+| bufreader-64k | 8,912 | ~0 |
+| mmap | 8,787 | ~4 MiB |
+| hugepage-memfd | 10,152 | ~128 MiB |
+| **hugepage-streaming-8m** | **7,791** | **~8 MiB** |
+
+**1 GiB compressed corpus (1,027.9 MiB compressed → 2,048 MiB), warm cache:**
+
+| Mode | Throughput (MB/s) | Hugepage RSS | Notes |
+|------|------------------:|-------------:|-------|
+| bufreader-64k | 12,128 | ~0 | |
+| mmap | 12,843 | ~4 MiB | |
+| hugepage-memfd | — | — | pool exhausted (needs 514 pages) |
+| **hugepage-streaming-8m** | **10,761** | **~8 MiB** | only hugepage path |
+
+### Analysis: why streaming is slower
+
+The refill memcpy (source 4 KiB mmap → hugepage scratch) is the dominant cost:
+
+- **256 MiB**: 128.5 MiB compressed ÷ 8 MiB scratch = 16 refills; 128 MiB copied.
+  Each refill scans 8 MiB / 4 KiB = 2,048 4 KiB PTEs, incurring the same TLB pressure
+  as the original mmap-populate path.  Over 16 refills: 32,768 PTEs total — identical to
+  the mmap-populate total.  Measured overhead: +8 ms vs hugepage-memfd (refill memcpy
+  ≈ 2.5 ms + TLB-miss penalty ≈ 5.5 ms).  Streaming is 30.4% slower than hugepage-memfd
+  and 13.4% slower than bufreader-64k on the 256 MiB corpus.
+
+- **1 GiB**: 1,027.9 MiB ÷ 8 MiB ≈ 128 refills; ~1,024 MiB copied.  Measured overhead:
+  +22.5 ms vs bufreader.  The copy fraction is 11.3% of total decode time at 1 GiB
+  (vs 23.2% at 256 MiB) because total decode time scales with output size while the
+  per-refill copy cost scales with compressed input.
+
+The TLB win from the hugepage scratch is real for the zstd decode step (only 4 PMD
+entries for the 8 MiB scratch), but the refill copy pays the same 4 KiB PTE tax that
+originally motivated the hugepage approach, negating the net gain.
+
+### Decision — (b) Ship alongside as explicit opt-in
+
+Conditions for (a) not met: streaming is 30% slower than hugepage-memfd on 256 MiB
+(threshold: ≤ 5%).
+
+Conditions for (b) met:
+- Streaming is >5% slower than hugepage-memfd on 256 MiB. (yes)
+- Streaming is the *only* hugepage-backed path for files exceeding the hugepage pool
+  (1 GiB compressed corpus, pool = 320 MiB). (yes)
+- The 1 GiB bench completed successfully, bounded RSS at 8 MiB. (yes)
+
+**Recommendation:**
+- Files that fit in the hugepage pool: use `open_hugepage_memfd` (fastest, +15% vs BufReader).
+- Files that exceed the hugepage pool: use `open_hugepage_streaming` (only hugepage option; 12.7% below bufreader, 16% below mmap at 1 GiB, but bounded 8 MiB hugepage RSS).
+- No-hugepage workloads: `from_mmap` (portable, ~4 MiB RSS, within 5% of BufReader at 1 GiB).
+
+### Surprises
+
+**mmap beats streaming and BufReader at 1 GiB.** At 256 MiB, mmap trails BufReader by 1.4%;
+at 1 GiB, mmap is 5.7% *faster* than BufReader (12,843 vs 12,128 MB/s).  The zero-copy
+advantage of mmap over BufReader's read() syscalls grows with corpus size; the TLB penalty
+(proportional to PTEs) remains constant per MB and becomes a smaller fraction of total time
+as the decode workload grows.
+
+**Streaming overhead percentage shrinks at 1 GiB.** The refill's TLB penalty per refill is
+fixed (8 MiB / 4 KiB = 2,048 PTEs); the decode work per refill scales with how many
+decompressed bytes zstd produces from one scratch fill.  On the 2:1 corpus, each 8 MiB
+compressed chunk decompresses to ~16 MiB; at higher compression ratios the decode work per
+refill grows, further amortising the refill overhead.
+
+**A larger window would help.** §5 of `docs/streaming-bench.md` notes that a 64 MiB window
+would reduce refill count 8× (2 refills for 256 MiB), potentially closing the gap to ≤ 5% of
+BufReader.  This is left as future work; it requires 32 hugepages (64 MiB) reserved, which is
+well within the 160-page pool.
+
+### Decisions for future cycles
+
+- The primary bottleneck is the refill memcpy from 4 KiB source pages — not the
+  decoder itself.  A larger window is the clearest lever; experiment with 64 MiB.
+- The streaming path is the only one that enables hugepage-backed decode of files
+  larger than the hugepage pool; this is its unique value even when slower than mmap.
+- `DEFAULT_STREAMING_WINDOW = 8 MiB` (4 hugepages) is a reasonable default for
+  constrained hugepage pools; document it as the minimum viable window.
+- The 50/50 random+repetitive corpus at 2:1 compression is a poor proxy for
+  compression-ratio sensitivity (see cycle-06 distillation).  A structured corpus
+  with higher compressible fraction would let future cycles measure the per-refill
+  decode-work amortisation more cleanly.

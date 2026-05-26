@@ -20,6 +20,18 @@ The fix is to place the compressed input on 2 MiB huge pages before decoding. `M
 | file mmap + MADV_HUGEPAGE | `(removed — see CHANGELOG)` (cycle 03) | 8,076 | 9 MB | no change; THPeligible=0 for file VMA |
 | hugepage-anon (H3b) | `Decoder::open_hugepage` | **9,910** | ~133 MB | **+15%**; MAP_HUGETLB anon copy-in |
 | hugepage-memfd (H3c) | `Decoder::open_hugepage_memfd` | **9,944** | ~133 MB | **+15%**; memfd direct read, fewer faults |
+| hugepage-streaming-8m (S3) | `Decoder::open_hugepage_streaming(8 MiB)` | 7,791 | ~8 MB | −13% vs BufReader; bounded hugepage RSS; supports arbitrarily large files |
+
+### Synthetic 1 GiB compressed corpus (zstd level 3, ~1,028 MiB compressed → 2,048 MiB, warm cache)
+
+Only modes that can handle files exceeding the 320 MiB hugepage pool are shown.
+`hugepage-anon` and `hugepage-memfd` require 514 pages (1 GiB) — pool exhausted.
+
+| Mode | Constructor | Throughput (MB/s) | dRSS | Notes |
+|------|-------------|------------------:|-----:|-------|
+| naive BufReader | `zstd+BufReader<64 KiB>` | **12,128** | ~0 | reuses 64 KiB buffer; hot cache |
+| file mmap | `Decoder::from_mmap` | 12,843 | ~4 MB | MADV_SEQUENTIAL; zero-copy at scale |
+| **hugepage-streaming-8m** | `Decoder::open_hugepage_streaming(8 MiB)` | **10,761** | **~8 MB** | **only hugepage path for large files; bounded RSS** |
 
 ### Real Binance BTCUSD file (214 MiB compressed → 1.8 GiB, warm cache, `mmapzstd-bench`)
 
@@ -44,6 +56,9 @@ Reads the compressed file into a `Vec`, then copies it into a `MAP_HUGETLB | MAP
 
 **Hugepage memfd copy-in (H3c)** (`Decoder::open_hugepage_memfd`) — maximum throughput, fewer faults.  
 Allocates a `memfd_create(MFD_HUGETLB | MFD_HUGE_2MB)` file descriptor, maps it, and reads the compressed file directly into the mapped region—no intermediate `Vec`. Fault count drops to ~107 per open (vs ~55k for H3b). Marginally faster than H3b; preferred when hugepages are available. Returns `io::ErrorKind::OutOfMemory` if hugepage allocation fails.
+
+**Hugepage streaming scratch (S3)** (`Decoder::open_hugepage_streaming`) — bounded hugepage RSS, arbitrarily large files.  
+Allocates a fixed-size `MAP_HUGETLB` scratch (default 8 MiB = 4 hugepages) and sequentially refills it from the source mmap as the decoder consumes input. The source mmap remains 4 KiB-backed; only the scratch uses huge pages. Hugepage RSS is bounded to the scratch size regardless of corpus size—making this the only hugepage path that handles files larger than the hugepage pool. The refill memcpy from 4 KiB source pages to the hugepage scratch costs ~23% of total decode time (8 ms on 256 MiB, 22 ms on 1 GiB), leaving throughput 30% below `open_hugepage_memfd` and 13% below BufReader on the 256 MiB benchmark. Use `open_hugepage_memfd` for small files; use this constructor when the compressed file exceeds `vm.nr_hugepages × 2 MiB`. Returns `io::ErrorKind::OutOfMemory` if hugepage scratch allocation fails.
 
 ## Library usage
 
@@ -81,8 +96,9 @@ fn decompress(path: &std::path::Path) -> io::Result<Vec<u8>> {
 ```
 
 Constructor guide:
-- **`open_hugepage_memfd(path)`** — Linux ≥ 4.14, hugepages reserved: maximum throughput, direct read, ~107 faults/open.
-- **`open_hugepage(path)`** — Linux ≥ 2.6.17, hugepages reserved: same throughput, ~55k faults/open (Vec copy-in).
+- **`open_hugepage_memfd(path)`** — Linux ≥ 4.14, file fits in hugepage pool: maximum throughput (~10 GB/s), direct read, ~107 faults/open.
+- **`open_hugepage(path)`** — Linux ≥ 2.6.17, file fits in hugepage pool: same throughput, ~55k faults/open (Vec copy-in).
+- **`open_hugepage_streaming(path, window)`** — Linux ≥ 2.6.17, file exceeds hugepage pool: bounded `window`-byte hugepage RSS; use 8 MiB default (`DEFAULT_STREAMING_WINDOW`). Only 4 pages reserved required regardless of file size.
 - **`from_mmap(mmap)`** — all platforms: caller provides a pre-built `memmap2::Mmap`; portable low-RSS path.
 - **`from_slice(data)`** — caller manages backing memory (custom allocators, test stubs).
 
@@ -116,9 +132,10 @@ median: 695 ms / 2,668 MB/s
 
 | Requirement | Details |
 |-------------|---------|
-| Linux ≥ 2.6.17 | `MAP_HUGETLB` (`open_hugepage`) |
+| Linux ≥ 2.6.17 | `MAP_HUGETLB` (`open_hugepage`, `open_hugepage_streaming`) |
 | Linux ≥ 4.14 | `memfd_create(MFD_HUGETLB)` (`open_hugepage_memfd`) |
-| `vm.nr_hugepages ≥ ⌈compressed_size_MiB / 2⌉` | Both hugepage variants need pre-reserved 2 MiB pages |
+| `vm.nr_hugepages ≥ ⌈compressed_size_MiB / 2⌉` | `open_hugepage` / `open_hugepage_memfd` — full file in hugepages |
+| `vm.nr_hugepages ≥ ⌈window_MiB / 2⌉` (≥ 4 for 8 MiB default) | `open_hugepage_streaming` — scratch only; independent of file size |
 | Rust ≥ 1.75 | MSRV |
 
 ### Reserving huge pages
@@ -138,10 +155,10 @@ grep HugePages /proc/meminfo
 # Hugepagesize:        2048 kB
 ```
 
-160 pages covers up to 320 MiB of compressed input. If hugepages are not reserved, both
-`open_hugepage` and `open_hugepage_memfd` return `io::ErrorKind::OutOfMemory` with a message
-explaining how to reserve hugepages. There is no silent fallback — hugepage reservation is
-mandatory for these constructors.
+160 pages covers up to 320 MiB of compressed input for `open_hugepage` / `open_hugepage_memfd`.
+`open_hugepage_streaming` needs only 4 pages (8 MiB) regardless of file size.
+If hugepages are not reserved, all three constructors return `io::ErrorKind::OutOfMemory`
+with a message explaining how to reserve hugepages. There is no silent fallback.
 
 ## Read the paper
 
