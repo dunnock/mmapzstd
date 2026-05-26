@@ -52,6 +52,32 @@ impl<'a> std::ops::Deref for DecoderBuf<'a> {
     }
 }
 
+/// Streaming zstd decompressor backed by a memory-mapped (or hugepage-backed) input buffer.
+///
+/// `Decoder` implements [`std::io::Read`]; the caller drives the decode pace by
+/// calling `read`.  No bytes are decompressed ahead of demand beyond the zstd
+/// frame buffer (~128 KiB per block).
+///
+/// # Lifetime
+///
+/// `Decoder<'static>` owns its backing buffer (constructed via [`open`][Self::open],
+/// [`from_mmap`][Self::from_mmap], [`open_hugepage`][Self::open_hugepage], or
+/// [`open_hugepage_memfd`][Self::open_hugepage_memfd]).
+///
+/// `Decoder<'a>` borrows a caller-supplied slice (constructed via
+/// [`from_slice`][Self::from_slice]).
+///
+/// # Example
+///
+/// ```no_run
+/// use std::io::Read;
+/// use mmapzstd::decoder::Decoder;
+///
+/// let mut dec = Decoder::open(std::path::Path::new("data.zst"))?;
+/// let mut out = Vec::new();
+/// dec.read_to_end(&mut out)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct Decoder<'a> {
     buf: DecoderBuf<'a>,
     in_pos: usize,
@@ -60,6 +86,24 @@ pub struct Decoder<'a> {
 }
 
 impl Decoder<'static> {
+    /// Open `path` by memory-mapping the compressed file.
+    ///
+    /// Applies `MAP_POPULATE` (batch pre-fault), `MADV_SEQUENTIAL`, and
+    /// `MADV_HUGEPAGE` (Linux).  A 4 MiB sliding `MADV_DONTNEED` window retires
+    /// pages behind the decode cursor, keeping RSS at ~9 MB regardless of file size.
+    ///
+    /// This is the portable, low-RSS constructor.  On warm cache it is ~5% slower
+    /// than a 64 KiB `BufReader`; prefer [`open_hugepage_memfd`][Self::open_hugepage_memfd]
+    /// when Linux hugepages are available.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use mmapzstd::decoder::Decoder;
+    ///
+    /// let dec = Decoder::open(std::path::Path::new("data.zst"))?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         // SAFETY: the file is opened read-only and we do not mutate it.
@@ -69,6 +113,24 @@ impl Decoder<'static> {
         Self::from_mmap(mmap)
     }
 
+    /// Take ownership of a pre-built [`Mmap`] and prepare the zstd stream.
+    ///
+    /// Applies `MADV_SEQUENTIAL`, `MADV_HUGEPAGE` (Linux), and
+    /// `MADV_POPULATE_READ` (Linux ≥ 5.14) hints.  Use this when you need
+    /// fine-grained control over mmap options (e.g., to map a specific file
+    /// offset or apply custom flags before handing the mapping to the decoder).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use memmap2::MmapOptions;
+    /// use mmapzstd::decoder::Decoder;
+    ///
+    /// let file = std::fs::File::open("data.zst")?;
+    /// let mmap = unsafe { MmapOptions::new().map(&file)? };
+    /// let dec = Decoder::from_mmap(mmap)?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn from_mmap(mmap: Mmap) -> io::Result<Self> {
         apply_madvise(&mmap)?;
         let zstd = ZstdDecoder::new()?;
@@ -80,26 +142,91 @@ impl Decoder<'static> {
         })
     }
 
-    /// Open `path` by loading the compressed data into a 2 MiB `MAP_HUGETLB`
+    /// Open `path` by loading the compressed data into a `MAP_HUGETLB | MAP_HUGE_2MB`
     /// anonymous buffer (Linux only).
     ///
-    /// Placing the compressed input on huge pages reduces the TLB footprint for
-    /// the input scan from O(file_size / 4 KiB) entries to O(file_size / 2 MiB),
-    /// yielding ~16% higher throughput on warm-cache sequential reads compared to
-    /// `Decoder::open` on this hardware (i9-12900K, Linux 6.17).
+    /// Reads the file into a `Vec<u8>`, then copies it into a 2 MiB-page-backed
+    /// anonymous region.  Decoding from 64 PMD entries instead of ~32,768 PTEs
+    /// eliminates essentially all dTLB misses for the input scan, yielding
+    /// approximately +15% throughput over the BufReader baseline on warm-cache
+    /// sequential reads (i9-12900K, Linux 6.17, 128 MiB compressed input).
     ///
-    /// Falls back to `Decoder::open` transparently if `MAP_HUGETLB` is
-    /// unavailable (no hugepages reserved, or non-Linux platform).
-    /// Open `path` by loading the compressed data into a `memfd_create(MFD_HUGETLB|MFD_HUGE_2MB)`
-    /// backed hugepage mapping (Linux only).
+    /// Falls back to [`open`][Self::open] transparently if `mmap(MAP_HUGETLB)`
+    /// fails (no hugepages reserved, or non-Linux platform).
     ///
-    /// Like [`open_hugepage`][Self::open_hugepage], this reduces TLB pressure by placing the
-    /// compressed input on 2 MiB pages.  The memfd variant allocates via the hugetlbfs file
-    /// descriptor interface rather than `MAP_ANONYMOUS|MAP_HUGETLB`, and reads the compressed
-    /// data directly into the mapped region without an intermediate copy through a `Vec`.
+    /// Requires `vm.nr_hugepages >= ceil(compressed_size_bytes / 2_MiB)`.
     ///
-    /// Falls back transparently to [`open`][Self::open] if `memfd_create`, `ftruncate`, or the
-    /// subsequent `mmap` fails (e.g. no huge pages reserved).
+    /// # Example
+    ///
+    /// ```no_run
+    /// use mmapzstd::decoder::Decoder;
+    ///
+    /// // Linux with hugepages reserved; falls back to Decoder::open otherwise.
+    /// let dec = Decoder::open_hugepage(std::path::Path::new("data.zst"))?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    #[cfg(target_os = "linux")]
+    pub fn open_hugepage(path: &Path) -> io::Result<Self> {
+        const HUGEPAGE: usize = 2 * 1024 * 1024;
+        const MAP_HUGE_2MB: libc::c_int = 21 << 26; // log2(2 MiB) = 21, MAP_HUGE_SHIFT = 26
+
+        let compressed = std::fs::read(path)?;
+        let len = compressed.len();
+        let capacity = (len + HUGEPAGE - 1) & !(HUGEPAGE - 1);
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                capacity,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_HUGETLB | MAP_HUGE_2MB,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return Self::open(path);
+        }
+
+        let ptr = ptr as *mut u8;
+        // SAFETY: ptr is valid for `capacity` bytes, and `compressed.len() == len <= capacity`.
+        unsafe { std::ptr::copy_nonoverlapping(compressed.as_ptr(), ptr, len) };
+
+        let zstd = ZstdDecoder::new()?;
+        Ok(Decoder {
+            buf: DecoderBuf::Hugepage(HugepageBuf { ptr, len, capacity }),
+            in_pos: 0,
+            retire_pos: 0,
+            zstd,
+        })
+    }
+
+    /// Open `path` via a `memfd_create(MFD_HUGETLB | MFD_HUGE_2MB)` hugepage mapping
+    /// (Linux ≥ 4.14 only).
+    ///
+    /// Allocates a hugepage-backed file descriptor, maps it, then reads the compressed
+    /// file directly into the mapped region—no intermediate `Vec`.  This avoids the
+    /// double-buffering copy of [`open_hugepage`][Self::open_hugepage] and reduces
+    /// copy-in minor faults from ~55k to ~107 per open.
+    ///
+    /// Throughput: ~9,944 MB/s on a 128 MiB compressed synthetic corpus
+    /// (i9-12900K, Linux 6.17, warm cache, Criterion median over 4 runs).
+    ///
+    /// Falls back to [`open`][Self::open] transparently if `memfd_create`,
+    /// `ftruncate`, or the subsequent `mmap` fails.
+    ///
+    /// Requires `vm.nr_hugepages >= ceil(compressed_size_bytes / 2_MiB)`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use mmapzstd::decoder::Decoder;
+    ///
+    /// // Preferred on Linux with hugepages reserved.
+    /// let dec = Decoder::open_hugepage_memfd(std::path::Path::new("data.zst"))?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     #[cfg(target_os = "linux")]
     pub fn open_hugepage_memfd(path: &Path) -> io::Result<Self> {
         use std::io::Read as _;
@@ -165,48 +292,28 @@ impl Decoder<'static> {
             zstd,
         })
     }
-
-    #[cfg(target_os = "linux")]
-    pub fn open_hugepage(path: &Path) -> io::Result<Self> {
-        const HUGEPAGE: usize = 2 * 1024 * 1024;
-        const MAP_HUGE_2MB: libc::c_int = 21 << 26; // log2(2 MiB) = 21, MAP_HUGE_SHIFT = 26
-
-        let compressed = std::fs::read(path)?;
-        let len = compressed.len();
-        let capacity = (len + HUGEPAGE - 1) & !(HUGEPAGE - 1);
-
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                capacity,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_HUGETLB | MAP_HUGE_2MB,
-                -1,
-                0,
-            )
-        };
-
-        if ptr == libc::MAP_FAILED {
-            return Self::open(path);
-        }
-
-        let ptr = ptr as *mut u8;
-        // SAFETY: ptr is valid for `capacity` bytes, and `compressed.len() == len <= capacity`.
-        unsafe { std::ptr::copy_nonoverlapping(compressed.as_ptr(), ptr, len) };
-
-        let zstd = ZstdDecoder::new()?;
-        Ok(Decoder {
-            buf: DecoderBuf::Hugepage(HugepageBuf { ptr, len, capacity }),
-            in_pos: 0,
-            retire_pos: 0,
-            zstd,
-        })
-    }
 }
 
 impl<'a> Decoder<'a> {
     /// Borrow compressed data from `data` without mapping; no madvise hints.
-    /// The caller controls the backing memory (e.g., a hugepage allocation).
+    ///
+    /// The caller controls the backing memory lifetime (e.g., a hugepage allocation,
+    /// a static byte slice, or a test fixture).  The slice must remain valid for the
+    /// lifetime of the `Decoder`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mmapzstd::decoder::Decoder;
+    ///
+    /// let compressed = zstd::encode_all(b"hello world".as_ref(), 0).unwrap();
+    /// let mut dec = Decoder::from_slice(&compressed).unwrap();
+    ///
+    /// use std::io::Read;
+    /// let mut out = Vec::new();
+    /// dec.read_to_end(&mut out).unwrap();
+    /// assert_eq!(out, b"hello world");
+    /// ```
     pub fn from_slice(data: &'a [u8]) -> io::Result<Self> {
         let zstd = ZstdDecoder::new()?;
         Ok(Decoder {
