@@ -90,6 +90,82 @@ impl Decoder<'static> {
     ///
     /// Falls back to `Decoder::open` transparently if `MAP_HUGETLB` is
     /// unavailable (no hugepages reserved, or non-Linux platform).
+    /// Open `path` by loading the compressed data into a `memfd_create(MFD_HUGETLB|MFD_HUGE_2MB)`
+    /// backed hugepage mapping (Linux only).
+    ///
+    /// Like [`open_hugepage`][Self::open_hugepage], this reduces TLB pressure by placing the
+    /// compressed input on 2 MiB pages.  The memfd variant allocates via the hugetlbfs file
+    /// descriptor interface rather than `MAP_ANONYMOUS|MAP_HUGETLB`, and reads the compressed
+    /// data directly into the mapped region without an intermediate copy through a `Vec`.
+    ///
+    /// Falls back transparently to [`open`][Self::open] if `memfd_create`, `ftruncate`, or the
+    /// subsequent `mmap` fails (e.g. no huge pages reserved).
+    #[cfg(target_os = "linux")]
+    pub fn open_hugepage_memfd(path: &Path) -> io::Result<Self> {
+        use std::io::Read as _;
+
+        const HUGEPAGE: usize = 2 * 1024 * 1024;
+        let mfd_hugetlb: libc::c_ulong = 0x0004;
+        let mfd_huge_2mb: libc::c_ulong = 21 << 26;
+
+        let len = path.metadata()?.len() as usize;
+        let capacity = (len + HUGEPAGE - 1) & !(HUGEPAGE - 1);
+
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                b"mmapzstd-hugetlb\0".as_ptr(),
+                mfd_hugetlb | mfd_huge_2mb,
+            )
+        };
+
+        if fd < 0 {
+            return Self::open(path);
+        }
+        let fd = fd as libc::c_int;
+
+        let rc = unsafe { libc::ftruncate(fd, capacity as libc::off_t) };
+        if rc != 0 {
+            unsafe { libc::close(fd) };
+            return Self::open(path);
+        }
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                capacity,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        unsafe { libc::close(fd) };
+
+        if ptr == libc::MAP_FAILED {
+            return Self::open(path);
+        }
+
+        let ptr = ptr as *mut u8;
+        // Read compressed file directly into the mapped hugepage region.
+        // SAFETY: ptr is valid for `capacity` bytes; we read exactly `len` bytes.
+        {
+            let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            if let Err(e) = std::fs::File::open(path)?.read_exact(buf) {
+                unsafe { libc::munmap(ptr as *mut libc::c_void, capacity) };
+                return Err(e);
+            }
+        }
+
+        let zstd = ZstdDecoder::new()?;
+        Ok(Decoder {
+            buf: DecoderBuf::Hugepage(HugepageBuf { ptr, len, capacity }),
+            in_pos: 0,
+            retire_pos: 0,
+            zstd,
+        })
+    }
+
     #[cfg(target_os = "linux")]
     pub fn open_hugepage(path: &Path) -> io::Result<Self> {
         const HUGEPAGE: usize = 2 * 1024 * 1024;
@@ -283,6 +359,19 @@ mod tests {
             #[cfg(target_os = "linux")]
             assert!(dec.retire_pos > 0, "retire_pos should advance on linux");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_hugepage_memfd_round_trip() {
+        let data: Vec<u8> = (0u16..1024).map(|i| (i % 251) as u8).collect();
+        let f = compressed_tempfile(&data);
+
+        let mut dec = Decoder::open_hugepage_memfd(f.path()).expect("open_hugepage_memfd");
+        let mut got = Vec::new();
+        dec.read_to_end(&mut got).expect("read_to_end");
+
+        assert_eq!(got, data);
     }
 
     #[cfg(target_os = "linux")]
