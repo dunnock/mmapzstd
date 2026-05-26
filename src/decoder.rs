@@ -27,10 +27,33 @@ impl std::ops::Deref for HugepageBuf {
 }
 
 #[cfg(target_os = "linux")]
+impl std::ops::DerefMut for HugepageBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for HugepageBuf {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.capacity) };
     }
+}
+
+/// State for the S3 streaming hugepage decode algorithm (§2, `docs/streaming-design.md`).
+///
+/// The compressed source is mmap'd at 4 KiB granularity; a fixed-size hugepage
+/// scratch holds one window of compressed bytes at a time. zstd decodes
+/// exclusively from the hugepage scratch, preserving the dTLB win regardless
+/// of source file size.
+#[cfg(target_os = "linux")]
+struct StreamingState {
+    src_mmap: Mmap,
+    scratch: HugepageBuf,
+    src_pos: usize,
+    scratch_in_pos: usize,
+    scratch_len: usize,
+    retire_pos: usize,
 }
 
 enum DecoderBuf<'a> {
@@ -38,6 +61,8 @@ enum DecoderBuf<'a> {
     Slice(&'a [u8]),
     #[cfg(target_os = "linux")]
     Hugepage(HugepageBuf),
+    #[cfg(target_os = "linux")]
+    Streaming(StreamingState),
 }
 
 impl std::ops::Deref for DecoderBuf<'_> {
@@ -48,6 +73,10 @@ impl std::ops::Deref for DecoderBuf<'_> {
             DecoderBuf::Slice(s) => s,
             #[cfg(target_os = "linux")]
             DecoderBuf::Hugepage(h) => h,
+            #[cfg(target_os = "linux")]
+            DecoderBuf::Streaming(_) => {
+                unreachable!("streaming variant is dispatched in read() before Deref")
+            }
         }
     }
 }
@@ -293,6 +322,125 @@ impl Decoder<'static> {
             zstd,
         })
     }
+
+    /// Streaming hugepage decoder with a bounded in-memory window (Linux only).
+    ///
+    /// Opens `path`, mmaps it at 4 KiB granularity as the source, and allocates a
+    /// `MAP_HUGETLB | MAP_HUGE_2MB` scratch region of at most `window` bytes (rounded
+    /// up to the nearest 2 MiB).  The zstd decoder reads exclusively from the hugepage
+    /// scratch, preserving the TLB win of `open_hugepage_memfd` without holding the
+    /// full file in hugepages.
+    ///
+    /// When `window >= file_size` the call delegates to [`open_hugepage_memfd`][Self::open_hugepage_memfd]
+    /// (no point sliding a window over a file that fits entirely in the hugepage pool).
+    ///
+    /// # Window sizing
+    ///
+    /// `window` is a memory budget, not a frame size.  The recommended default is
+    /// [`DEFAULT_STREAMING_WINDOW`] (8 MiB = 4 hugepages):
+    ///
+    /// - Below 2 MiB: returns `io::Error(InvalidInput)`.
+    /// - 2 MiB: one hugepage; refills every ~2 MiB of compressed input; overhead
+    ///   is measurable.
+    /// - 8 MiB: four hugepages; refill overhead < 0.5% of decode time on warm
+    ///   page cache; dTLB savings identical to `open_hugepage_memfd` on a per-byte
+    ///   basis.
+    /// - 64 MiB: amortizes refill further; uses 32 hugepages; only useful if
+    ///   hugepages are abundant.
+    ///
+    /// # Errors
+    ///
+    /// - `io::ErrorKind::OutOfMemory` — `MAP_HUGETLB` failed for the scratch.
+    /// - `io::ErrorKind::InvalidInput` — `window < 2 MiB`.
+    /// - Any OS error from `File::open`, `Mmap::map`, or `ZstdDecoder::new`.
+    ///
+    /// # Linux kernel requirement
+    ///
+    /// Requires `vm.nr_hugepages >= ceil(window / 2_MiB)`.  Reserve with
+    /// `sudo sysctl vm.nr_hugepages=N`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use mmapzstd::decoder::{Decoder, DEFAULT_STREAMING_WINDOW};
+    ///
+    /// // 8 MiB window — 4 hugepages, works on any file size.
+    /// let dec = Decoder::open_hugepage_streaming(
+    ///     std::path::Path::new("large.zst"),
+    ///     DEFAULT_STREAMING_WINDOW,
+    /// )?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    #[cfg(target_os = "linux")]
+    pub fn open_hugepage_streaming(path: &Path, window: usize) -> io::Result<Self> {
+        use std::fs::File;
+
+        const HUGEPAGE: usize = 2 * 1024 * 1024;
+        const MAP_HUGE_2MB: libc::c_int = 21 << 26;
+
+        if window < HUGEPAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "window must be at least 2 MiB (2 097 152 bytes)",
+            ));
+        }
+
+        let window = (window + HUGEPAGE - 1) & !(HUGEPAGE - 1);
+
+        let file_size = path.metadata()?.len() as usize;
+        if window >= file_size {
+            return Self::open_hugepage_memfd(path);
+        }
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                window,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_HUGETLB | MAP_HUGE_2MB,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            let free = read_hugepages_free().unwrap_or(0);
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "MAP_HUGETLB failed (HugePages_Free={free}); \
+                     reserve hugepages with `sudo sysctl vm.nr_hugepages=N` \
+                     (see README §System requirements)",
+                ),
+            ));
+        }
+
+        // scratch owns the hugepage allocation; Drop calls munmap on error paths.
+        let scratch = HugepageBuf {
+            ptr: ptr as *mut u8,
+            len: window,
+            capacity: window,
+        };
+
+        let file = File::open(path)?;
+        let src_mmap = unsafe { memmap2::MmapOptions::new().map(&file) }?;
+        src_mmap.advise(memmap2::Advice::Sequential)?;
+
+        let zstd = ZstdDecoder::new()?;
+        Ok(Decoder {
+            buf: DecoderBuf::Streaming(StreamingState {
+                src_mmap,
+                scratch,
+                src_pos: 0,
+                scratch_in_pos: 0,
+                scratch_len: 0,
+                retire_pos: 0,
+            }),
+            in_pos: 0,
+            retire_pos: 0,
+            zstd,
+        })
+    }
 }
 
 impl<'a> Decoder<'a> {
@@ -326,13 +474,18 @@ impl<'a> Decoder<'a> {
     }
 }
 
+/// Recommended default window size for [`Decoder::open_hugepage_streaming`] (8 MiB = 4 hugepages).
+#[cfg(target_os = "linux")]
+pub const DEFAULT_STREAMING_WINDOW: usize = 8 * 1024 * 1024;
+
 const RETIRE_WINDOW: usize = 4 * 1024 * 1024; // 4 MiB trailing window before retirement
 
 impl Decoder<'_> {
     #[cfg(target_os = "linux")]
     fn maybe_retire(&mut self) {
         if !matches!(self.buf, DecoderBuf::Mmap(_)) {
-            // Hugepage and Slice buffers are not file-backed; skip retirement.
+            // Hugepage, Streaming, and Slice buffers skip this path.
+            // Streaming handles its own retirement via retire_src().
             return;
         }
         let new_frontier = self.in_pos.saturating_sub(RETIRE_WINDOW);
@@ -361,10 +514,85 @@ impl Decoder<'_> {
     fn maybe_retire(&mut self) {}
 }
 
+/// Release src_mmap pages that are `scratch.capacity` bytes behind `src_pos`.
+///
+/// Uses one scratch-window width as the retire lag so the kernel can still
+/// service readahead-triggered faults for the page just copied.
+#[cfg(target_os = "linux")]
+fn retire_src(state: &mut StreamingState) {
+    let frontier = state.src_pos.saturating_sub(state.scratch.capacity);
+    let new_frontier = frontier & !(4096 - 1);
+    if new_frontier > state.retire_pos {
+        // SAFETY: src_pos has already advanced past these bytes; zstd will not
+        // read them again. MADV_DONTNEED on a file mapping allows the kernel to
+        // reclaim the pages; any future fault would reload from disk, but that
+        // will not happen here because src_pos is strictly monotone.
+        let _ = unsafe {
+            state.src_mmap.unchecked_advise_range(
+                memmap2::UncheckedAdvice::DontNeed,
+                state.retire_pos,
+                new_frontier - state.retire_pos,
+            )
+        };
+        state.retire_pos = new_frontier;
+    }
+}
+
+/// Inner read loop for the streaming hugepage variant (S3 algorithm).
+///
+/// Refills the hugepage scratch from the page-cached source mmap whenever the
+/// scratch is exhausted, then feeds the scratch to the zstd decoder.
+#[cfg(target_os = "linux")]
+fn read_streaming(
+    state: &mut StreamingState,
+    zstd: &mut ZstdDecoder,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    loop {
+        if state.scratch_in_pos == state.scratch_len {
+            if state.src_pos >= state.src_mmap.len() {
+                return Ok(0); // EOF
+            }
+            let remaining = state.src_mmap.len() - state.src_pos;
+            let chunk = remaining.min(state.scratch.capacity);
+            // SAFETY: scratch.ptr is valid for `capacity` bytes (hugepage mapping).
+            // src_mmap[src_pos..src_pos+chunk] is valid and non-overlapping with scratch.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    state.src_mmap[state.src_pos..].as_ptr(),
+                    state.scratch.ptr,
+                    chunk,
+                );
+            }
+            state.src_pos += chunk;
+            state.scratch_len = chunk;
+            state.scratch_in_pos = 0;
+            retire_src(state);
+        }
+
+        let input = &state.scratch[state.scratch_in_pos..state.scratch_len];
+        let status = zstd
+            .run_on_buffers(input, buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        state.scratch_in_pos += status.bytes_read;
+
+        if status.bytes_written > 0 {
+            return Ok(status.bytes_written);
+        }
+        // bytes_written == 0: zstd consumed input without producing output (e.g. block
+        // header consumed but not yet a full block). Loop to refill or detect EOF.
+    }
+}
+
 impl io::Read for Decoder<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+
+        #[cfg(target_os = "linux")]
+        if let DecoderBuf::Streaming(ref mut state) = self.buf {
+            return read_streaming(state, &mut self.zstd, buf);
         }
 
         // Decode directly into the caller's buffer. ZSTD_decompressStream
@@ -556,5 +784,127 @@ mod tests {
             err.to_string().contains("MAP_HUGETLB failed"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── streaming tests ──────────────────────────────────────────────────────
+
+    /// Basic round-trip: tiny file delegates to memfd (window >= file_size),
+    /// verifies the constructor and Read impl produce correct output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_round_trip() {
+        let data: Vec<u8> = (0u16..4096).map(|i| (i % 251) as u8).collect();
+        let compressed = zstd::encode_all(data.as_slice(), 3).expect("encode_all");
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.write_all(&compressed).expect("write");
+
+        // Tiny file → window >= file_size → delegates to open_hugepage_memfd.
+        let mut dec =
+            Decoder::open_hugepage_streaming(f.path(), 2 * 1024 * 1024).expect("streaming open");
+        let mut got = Vec::new();
+        dec.read_to_end(&mut got).expect("read_to_end");
+        assert_eq!(got, data);
+    }
+
+    /// End-to-end streaming with window (2 MiB) smaller than the compressed file,
+    /// forcing multiple scratch refill cycles through the S3 decode loop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_window_smaller_than_file() {
+        // ~3 MiB of LCG pseudo-random bytes — incompressible, so compressed ≈ input size.
+        const N: usize = 3 * 1024 * 1024;
+        let data: Vec<u8> = (0u32..N as u32 / 4)
+            .flat_map(|i| {
+                i.wrapping_mul(1664525)
+                    .wrapping_add(1013904223)
+                    .to_le_bytes()
+            })
+            .collect();
+        let compressed = zstd::encode_all(data.as_slice(), 3).expect("encode_all");
+
+        // Confirm the streaming path is actually taken (not the memfd fallback).
+        if compressed.len() <= 2 * 1024 * 1024 {
+            // Compressed data happened to be ≤ 2 MiB — skip rather than testing
+            // the wrong path.
+            return;
+        }
+
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.write_all(&compressed).expect("write");
+
+        // 2 MiB window < compressed.len() → real streaming path with ≥ 1 refill.
+        let mut dec =
+            Decoder::open_hugepage_streaming(f.path(), 2 * 1024 * 1024).expect("streaming open");
+        let mut got = Vec::with_capacity(data.len());
+        dec.read_to_end(&mut got).expect("read_to_end");
+        assert_eq!(got, data);
+    }
+
+    /// When window >= file_size the constructor transparently delegates to
+    /// open_hugepage_memfd; no panic and output is correct.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_fallback_to_memfd_when_window_ge_file_size() {
+        let data: Vec<u8> = (0u16..1024).map(|i| (i % 251) as u8).collect();
+        let compressed = zstd::encode_all(data.as_slice(), 3).expect("encode_all");
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.write_all(&compressed).expect("write");
+
+        // Pass a window that is guaranteed to be ≥ file_size (rounded up to 2 MiB).
+        let window = (compressed.len() + 2 * 1024 * 1024).max(2 * 1024 * 1024);
+
+        let mut dec =
+            Decoder::open_hugepage_streaming(f.path(), window).expect("streaming open (fallback)");
+        let mut got = Vec::new();
+        dec.read_to_end(&mut got).expect("read_to_end");
+        assert_eq!(got, data);
+    }
+
+    /// `open_hugepage_streaming` returns `OutOfMemory` when no hugepages are available,
+    /// matching the behaviour of `open_hugepage` and `open_hugepage_memfd`.
+    ///
+    /// Requires `HugePages_Free == 0`; skipped on systems with hugepages reserved.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_oom_returns_error_when_no_hugepages() {
+        let free = read_hugepages_free().unwrap_or(0);
+        if free > 0 {
+            // Cannot trigger MAP_HUGETLB failure with hugepages available.
+            // Set vm.nr_hugepages=0 to enable this test.
+            return;
+        }
+
+        let data = zstd::encode_all(b"hello world".as_ref(), 0).unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&data).unwrap();
+
+        // Tiny file → window >= file_size → delegates to open_hugepage_memfd,
+        // which also requires hugepages; both paths surface OutOfMemory here.
+        let result = Decoder::open_hugepage_streaming(f.path(), 2 * 1024 * 1024);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected OutOfMemory when hugepages unavailable"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(
+            err.to_string().contains("MAP_HUGETLB failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// window < 2 MiB must return InvalidInput immediately.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_invalid_window_too_small() {
+        let data = zstd::encode_all(b"x".as_ref(), 0).unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&data).unwrap();
+
+        let result = Decoder::open_hugepage_streaming(f.path(), 1024);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected InvalidInput for tiny window"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "mmapzstd"
-# 0.2.0: removed Decoder::open and MAP_POPULATE; see CHANGELOG
-version = "0.2.0"
+# 0.3.0: add Decoder::open_hugepage_streaming (S3 streaming hugepage); see CHANGELOG
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 description = "mmap-backed zstd decompressor with backpressure"
