@@ -31,3 +31,7 @@ path = "src/bin/bench.rs"
 [[bench]]
 name = "decompress"
 harness = false
+
+[[bench]]
+name = "levels"
+harness = false

@@ -130,9 +130,8 @@ impl io::Read for ScratchReader {
         }
         let available = self.end - self.start;
         let to_copy = available.min(dst.len());
-        let src = unsafe {
-            std::slice::from_raw_parts(self.alloc.as_mut_ptr().add(self.start), to_copy)
-        };
+        let src =
+            unsafe { std::slice::from_raw_parts(self.alloc.as_mut_ptr().add(self.start), to_copy) };
         dst[..to_copy].copy_from_slice(src);
         self.start += to_copy;
         Ok(to_copy)
@@ -172,7 +171,8 @@ fn read_hugepages_free() -> u64 {
 // ── fixture ───────────────────────────────────────────────────────────────────
 
 fn get_or_create_fixture() -> (PathBuf, Option<NamedTempFile>) {
-    let persistent = PathBuf::from("/work/cargo-target-ralph/mmapzstd-fixtures/decompress_256mib.zst");
+    let persistent =
+        PathBuf::from("/work/cargo-target-ralph/mmapzstd-fixtures/decompress_256mib.zst");
     if persistent.exists() {
         return (persistent, None);
     }
@@ -257,8 +257,7 @@ fn maybe_emit_escalation() {
     if free > 0 {
         return; // hugepages exist but failed for another reason — don't escalate
     }
-    let path =
-        "/work/ralph-self-improvement/workspace/.escalations/cycle03-hugepages-setup.md";
+    let path = "/work/ralph-self-improvement/workspace/.escalations/cycle03-hugepages-setup.md";
     if std::path::Path::new(path).exists() {
         return;
     }
@@ -323,9 +322,7 @@ fn main() {
     } else {
         let errno = unsafe { *libc::__errno_location() };
         let free = read_hugepages_free();
-        println!(
-            "MAP_HUGETLB: UNAVAILABLE (errno={errno}, HugePages_Free={free})"
-        );
+        println!("MAP_HUGETLB: UNAVAILABLE (errno={errno}, HugePages_Free={free})");
         if free == 0 {
             maybe_emit_escalation();
         }
@@ -347,43 +344,72 @@ fn main() {
 
     // H4-ctrl — normal BufReader 64 KiB (cycle-02 baseline, always runs)
     let pte_before_ctrl = read_vm_pte_kb();
-    bench("H4-ctrl BufReader 64 KiB (normal pages)", &path, &|p| {
-        let f = File::open(p).expect("open");
-        let buf = BufReader::with_capacity(65_536, f);
-        Box::new(zstd::stream::Decoder::new(buf).expect("decoder"))
-    }, pte_before_ctrl);
+    bench(
+        "H4-ctrl BufReader 64 KiB (normal pages)",
+        &path,
+        &|p| {
+            let f = File::open(p).expect("open");
+            let buf = BufReader::with_capacity(65_536, f);
+            Box::new(zstd::stream::Decoder::new(buf).expect("decoder"))
+        },
+        pte_before_ctrl,
+    );
 
     if hugepages_ok {
         // H4a — hugepage scratch, 64 KiB read chunks
         let pte_before = read_vm_pte_kb();
-        bench("H4a hugepage-scratch 64 KiB chunks (read)", &path, &|p| {
-            let alloc = HugepageAlloc::try_hugepage(SCRATCH_LEN).expect("MAP_HUGETLB");
-            let f = File::open(p).expect("open");
-            let scratch = ScratchReader::new(f, alloc, 64 * 1024, false);
-            Box::new(zstd::stream::Decoder::new(scratch).expect("decoder"))
-        }, pte_before);
+        bench(
+            "H4a hugepage-scratch 64 KiB chunks (read)",
+            &path,
+            &|p| {
+                let alloc = HugepageAlloc::try_hugepage(SCRATCH_LEN).expect("MAP_HUGETLB");
+                let f = File::open(p).expect("open");
+                let scratch = ScratchReader::new(f, alloc, 64 * 1024, false);
+                Box::new(zstd::stream::Decoder::new(scratch).expect("decoder"))
+            },
+            pte_before,
+        );
 
         // H4b — hugepage scratch, 256 KiB read chunks
         let pte_before = read_vm_pte_kb();
-        bench("H4b hugepage-scratch 256 KiB chunks (read)", &path, &|p| {
-            let alloc = HugepageAlloc::try_hugepage(SCRATCH_LEN).expect("MAP_HUGETLB");
-            let f = File::open(p).expect("open");
-            let scratch = ScratchReader::new(f, alloc, 256 * 1024, false);
-            Box::new(zstd::stream::Decoder::new(scratch).expect("decoder"))
-        }, pte_before);
+        bench(
+            "H4b hugepage-scratch 256 KiB chunks (read)",
+            &path,
+            &|p| {
+                let alloc = HugepageAlloc::try_hugepage(SCRATCH_LEN).expect("MAP_HUGETLB");
+                let f = File::open(p).expect("open");
+                let scratch = ScratchReader::new(f, alloc, 256 * 1024, false);
+                Box::new(zstd::stream::Decoder::new(scratch).expect("decoder"))
+            },
+            pte_before,
+        );
 
         // H4c — hugepage scratch, 64 KiB pread64 chunks
         let pte_before = read_vm_pte_kb();
-        bench("H4c hugepage-scratch 64 KiB chunks (pread64)", &path, &|p| {
-            let alloc = HugepageAlloc::try_hugepage(SCRATCH_LEN).expect("MAP_HUGETLB");
-            let f = File::open(p).expect("open");
-            let scratch = ScratchReader::new(f, alloc, 64 * 1024, true);
-            Box::new(zstd::stream::Decoder::new(scratch).expect("decoder"))
-        }, pte_before);
+        bench(
+            "H4c hugepage-scratch 64 KiB chunks (pread64)",
+            &path,
+            &|p| {
+                let alloc = HugepageAlloc::try_hugepage(SCRATCH_LEN).expect("MAP_HUGETLB");
+                let f = File::open(p).expect("open");
+                let scratch = ScratchReader::new(f, alloc, 64 * 1024, true);
+                Box::new(zstd::stream::Decoder::new(scratch).expect("decoder"))
+            },
+            pte_before,
+        );
     } else {
-        println!("{:<52}  SKIPPED: operator pending (HugePages_Free=0)", "H4a hugepage-scratch 64 KiB chunks (read)");
-        println!("{:<52}  SKIPPED: operator pending (HugePages_Free=0)", "H4b hugepage-scratch 256 KiB chunks (read)");
-        println!("{:<52}  SKIPPED: operator pending (HugePages_Free=0)", "H4c hugepage-scratch 64 KiB chunks (pread64)");
+        println!(
+            "{:<52}  SKIPPED: operator pending (HugePages_Free=0)",
+            "H4a hugepage-scratch 64 KiB chunks (read)"
+        );
+        println!(
+            "{:<52}  SKIPPED: operator pending (HugePages_Free=0)",
+            "H4b hugepage-scratch 256 KiB chunks (read)"
+        );
+        println!(
+            "{:<52}  SKIPPED: operator pending (HugePages_Free=0)",
+            "H4c hugepage-scratch 64 KiB chunks (pread64)"
+        );
     }
 
     println!();

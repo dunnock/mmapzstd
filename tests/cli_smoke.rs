@@ -68,12 +68,15 @@ fn assert_row(rows: &[Vec<String>], mode: &str) {
     assert_eq!(rows.len(), 1, "expected 1 data row for mode {mode}");
     let row = &rows[0];
     // CSV columns: mode,run,wall_ns,decompressed_bytes,throughput_mbps,drss_kib,minfaults
-    let decompressed: u64 = row[3].parse().unwrap_or_else(|_| panic!("parse decompressed: {:?}", row[3]));
-    let throughput: f64 = row[4].parse().unwrap_or_else(|_| panic!("parse throughput: {:?}", row[4]));
+    let decompressed: u64 = row[3]
+        .parse()
+        .unwrap_or_else(|_| panic!("parse decompressed: {:?}", row[3]));
+    let throughput: f64 = row[4]
+        .parse()
+        .unwrap_or_else(|_| panic!("parse throughput: {:?}", row[4]));
 
     assert_eq!(
-        decompressed,
-        CORPUS_SIZE as u64,
+        decompressed, CORPUS_SIZE as u64,
         "decompressed size mismatch for mode {mode}: got {decompressed}, want {CORPUS_SIZE}"
     );
     assert!(

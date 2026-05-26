@@ -6,7 +6,9 @@ fn main() {
     const BLOCK: usize = 4096;
     const TOTAL: usize = 256 * 1024 * 1024;
 
-    let out_path = std::env::args().nth(1).expect("usage: gen_fixture <output_path>");
+    let out_path = std::env::args()
+        .nth(1)
+        .expect("usage: gen_fixture <output_path>");
 
     let mut data = vec![0u8; TOTAL];
     let mut rng = rand::thread_rng();

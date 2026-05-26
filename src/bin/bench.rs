@@ -77,32 +77,28 @@ fn hugepages_free() -> u64 {
 
 fn needed_hugepages(compressed_len: u64) -> u64 {
     const HUGEPAGE: u64 = 2 * 1024 * 1024;
-    (compressed_len + HUGEPAGE - 1) / HUGEPAGE
+    compressed_len.div_ceil(HUGEPAGE)
 }
 
 fn open_reader_hugepage_anon(path: &std::path::Path) -> io::Result<Box<dyn Read>> {
     #[cfg(target_os = "linux")]
     {
-        mmapzstd::decoder::Decoder::open_hugepage(path)
-            .map(|d| Box::new(d) as Box<dyn Read>)
+        mmapzstd::decoder::Decoder::open_hugepage(path).map(|d| Box::new(d) as Box<dyn Read>)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        mmapzstd::decoder::Decoder::open(path)
-            .map(|d| Box::new(d) as Box<dyn Read>)
+        mmapzstd::decoder::Decoder::open(path).map(|d| Box::new(d) as Box<dyn Read>)
     }
 }
 
 fn open_reader_hugepage_memfd(path: &std::path::Path) -> io::Result<Box<dyn Read>> {
     #[cfg(target_os = "linux")]
     {
-        mmapzstd::decoder::Decoder::open_hugepage_memfd(path)
-            .map(|d| Box::new(d) as Box<dyn Read>)
+        mmapzstd::decoder::Decoder::open_hugepage_memfd(path).map(|d| Box::new(d) as Box<dyn Read>)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        mmapzstd::decoder::Decoder::open(path)
-            .map(|d| Box::new(d) as Box<dyn Read>)
+        mmapzstd::decoder::Decoder::open(path).map(|d| Box::new(d) as Box<dyn Read>)
     }
 }
 
@@ -246,7 +242,9 @@ fn main() -> io::Result<()> {
             "| {:<3} | {:<9} | {:<12} | {:<17} | {:<10} | {:<12} |",
             "run", "wall", "decompressed", "throughput (MB/s)", "dRSS (KiB)", "minor faults"
         );
-        println!("|-----|-----------|--------------|-------------------|------------|--------------|");
+        println!(
+            "|-----|-----------|--------------|-------------------|------------|--------------|"
+        );
         for (run, r) in &results {
             println!(
                 "| {:<3} | {:<9} | {:<12} | {:<17} | {:<10} | {:<12} |",

@@ -40,7 +40,7 @@ enum DecoderBuf<'a> {
     Hugepage(HugepageBuf),
 }
 
-impl<'a> std::ops::Deref for DecoderBuf<'a> {
+impl std::ops::Deref for DecoderBuf<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match self {
@@ -327,7 +327,7 @@ impl<'a> Decoder<'a> {
 
 const RETIRE_WINDOW: usize = 4 * 1024 * 1024; // 4 MiB trailing window before retirement
 
-impl<'a> Decoder<'a> {
+impl Decoder<'_> {
     #[cfg(target_os = "linux")]
     fn maybe_retire(&mut self) {
         if !matches!(self.buf, DecoderBuf::Mmap(_)) {
@@ -360,7 +360,7 @@ impl<'a> Decoder<'a> {
     fn maybe_retire(&mut self) {}
 }
 
-impl<'a> io::Read for Decoder<'a> {
+impl io::Read for Decoder<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);

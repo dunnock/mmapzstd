@@ -69,8 +69,7 @@ fn bench(label: &str, path: &Path, variant_fn: &dyn Fn(&Path) -> Box<dyn io::Rea
 
     let measured = &all[WARMUP..];
     let n = measured.len() as f64;
-    let avg_ms =
-        measured.iter().map(|(d, _)| d.as_secs_f64()).sum::<f64>() * 1000.0 / n;
+    let avg_ms = measured.iter().map(|(d, _)| d.as_secs_f64()).sum::<f64>() * 1000.0 / n;
     let avg_faults = measured.iter().map(|(_, f)| *f).sum::<u64>() / measured.len() as u64;
     let bytes = 256u64 * 1024 * 1024;
     let throughput_mbs = bytes as f64 / 1_048_576.0 / (avg_ms / 1000.0);
@@ -129,14 +128,26 @@ fn main() {
     println!("{}", "-".repeat(90));
 
     // H1 — buffer size sweep
-    bench("H1a BufReader  64 KiB (baseline)", path, &bufreader_cap(64 * 1024));
+    bench(
+        "H1a BufReader  64 KiB (baseline)",
+        path,
+        &bufreader_cap(64 * 1024),
+    );
     bench("H1b BufReader 256 KiB", path, &bufreader_cap(256 * 1024));
     bench("H1c BufReader   1 MiB", path, &bufreader_cap(1024 * 1024));
-    bench("H1d BufReader   4 MiB", path, &bufreader_cap(4 * 1024 * 1024));
+    bench(
+        "H1d BufReader   4 MiB",
+        path,
+        &bufreader_cap(4 * 1024 * 1024),
+    );
 
     // H2 — posix_fadvise
     #[cfg(unix)]
-    bench("H2  BufReader 64 KiB + fadvise(SEQ+WILLNEED)", path, &bufreader_fadvise);
+    bench(
+        "H2  BufReader 64 KiB + fadvise(SEQ+WILLNEED)",
+        path,
+        &bufreader_fadvise,
+    );
 
     // H4 — raw File (no BufReader)
     bench("H4  raw File (no BufReader)", path, &raw_file);
