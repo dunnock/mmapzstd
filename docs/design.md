@@ -10,9 +10,9 @@ use memmap2::Mmap;
 /// Decompresses a zstd-compressed file via a memory-mapped region.
 ///
 /// `'a` is the lifetime of the backing byte slice. The owned constructors
-/// (`open`, `from_mmap`) store the `Mmap` inside the struct; they return
-/// `Decoder<'static>`. The parameter exists to enable a future
-/// `from_slice(data: &'a [u8])` variant without an API break.
+/// (`from_mmap`, `open_hugepage`, `open_hugepage_memfd`) store the buffer
+/// inside the struct; they return `Decoder<'static>`. The `'a` parameter
+/// enables `from_slice(data: &'a [u8])` for caller-managed backing.
 pub struct Decoder<'a> { /* private */ }
 
 impl<'a> Read for Decoder<'a> {
@@ -20,19 +20,31 @@ impl<'a> Read for Decoder<'a> {
 }
 
 impl Decoder<'static> {
-    /// Open `path` read-only, mmap it, and configure hints.
-    pub fn open(path: &Path) -> io::Result<Self>;
-
     /// Take ownership of `mmap` and prepare the zstd stream.
     pub fn from_mmap(mmap: Mmap) -> io::Result<Self>;
+
+    /// Load compressed data into a MAP_HUGETLB anon buffer (Linux only).
+    #[cfg(target_os = "linux")]
+    pub fn open_hugepage(path: &Path) -> io::Result<Self>;
+
+    /// Load compressed data via memfd_create(MFD_HUGETLB) (Linux ≥ 4.14 only).
+    #[cfg(target_os = "linux")]
+    pub fn open_hugepage_memfd(path: &Path) -> io::Result<Self>;
+}
+
+impl<'a> Decoder<'a> {
+    /// Borrow compressed data from a caller-supplied slice.
+    pub fn from_slice(data: &'a [u8]) -> io::Result<Self>;
 }
 ```
 
-**Lifetime story.** Both constructors own the `Mmap`. The inner zstd decoder
-holds a raw `*const [u8]` into the mmap region; because `Mmap` is owned inside
-`Decoder` and never exposed by `&mut self`, those bytes are stable for the
-struct's lifetime. The `Mmap` kernel mapping is not invalidated by moving the
-handle (the physical pages stay put). `Decoder` is `!Send` and `!Sync` (raw
+Note: `Decoder::open(path)` was removed in 0.2.0. Callers who want a portable
+file-mmap path should build a `memmap2::Mmap` and pass it through `from_mmap`.
+
+**Lifetime story.** Owned constructors store the backing buffer inside `Decoder`.
+The inner zstd decoder holds a raw `*const [u8]` into that buffer; because the
+buffer is owned inside `Decoder` and never exposed by `&mut self`, those bytes
+are stable for the struct's lifetime. `Decoder` is `!Send` and `!Sync` (raw
 pointer; add explicit `unsafe impl` only if benchmarked on a multi-core
 harness, which is out of scope for this crate).
 
@@ -62,12 +74,11 @@ no control over system configuration and the `mmap(MAP_HUGETLB)` call silently
 falls back (or errors) if the pool is empty. `MADV_HUGEPAGE` (THP) is always
 safe — the kernel chooses whether to promote.
 
-**MAP_POPULATE vs lazy faults.** We do *not* use `MAP_POPULATE`. It would fault
-in the entire file at map time, increasing RSS to the full compressed file size
-before any decompression. With `MADV_SEQUENTIAL`, the kernel's readahead covers
-the upcoming window; lazy faulting keeps RSS bounded. If the caller knows it
-will read the full file (common in benchmarks), it may pass `populate: true`
-via a future `DecoderOptions` builder — omitted from this cycle.
+**MAP_POPULATE vs lazy faults.** We do *not* use `MAP_POPULATE` or
+`MADV_POPULATE_READ`. Measurements showed ~0.5% wall-time contribution on the
+hugepage path — below criterion noise. Both were removed in 0.2.0 along with
+`Decoder::open`. With `MADV_SEQUENTIAL`, the kernel's readahead covers the
+upcoming window; lazy faulting keeps RSS bounded.
 
 ---
 

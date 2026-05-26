@@ -48,13 +48,15 @@ fn bench_decompress(c: &mut Criterion) {
     ensure_fixture(&path);
 
     // H3a: mmapzstd decoder with fixture on ext4 (/work bind-mount), THP eligible.
-    // MADV_HUGEPAGE + MADV_POPULATE_READ are applied in Decoder::open via apply_madvise().
+    // MADV_SEQUENTIAL + MADV_HUGEPAGE are applied in from_mmap via apply_madvise().
     let mut group = c.benchmark_group("mmapzstd");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(30));
     group.bench_function("decompress", |b| {
         b.iter(|| {
-            let mut dec = mmapzstd::decoder::Decoder::open(&path).expect("open");
+            let file = File::open(&path).expect("open");
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("mmap") };
+            let mut dec = mmapzstd::decoder::Decoder::from_mmap(mmap).expect("from_mmap");
             io::copy(&mut dec, &mut io::sink()).expect("copy");
         });
     });

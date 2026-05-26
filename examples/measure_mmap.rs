@@ -58,7 +58,9 @@ fn main() {
     let (minflt_before, majflt_before) = read_proc_stat();
 
     let start = std::time::Instant::now();
-    let mut dec = mmapzstd::decoder::Decoder::open(&path).expect("open");
+    let file = std::fs::File::open(&path).expect("open file");
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("mmap") };
+    let mut dec = mmapzstd::decoder::Decoder::from_mmap(mmap).expect("from_mmap");
     io::copy(&mut dec, &mut io::sink()).expect("copy");
     let elapsed = start.elapsed();
 
@@ -73,5 +75,9 @@ fn main() {
     println!("throughput:   {:.1} MB/s", throughput_mb);
     println!("minor faults: {}", minflt_after - minflt_before);
     println!("major faults: {}", majflt_after - majflt_before);
-    println!("Peak RSS:     {} kB ({:.1} MB)", hwm_kb, hwm_kb as f64 / 1024.0);
+    println!(
+        "Peak RSS:     {} kB ({:.1} MB)",
+        hwm_kb,
+        hwm_kb as f64 / 1024.0
+    );
 }

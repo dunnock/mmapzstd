@@ -10,28 +10,46 @@
 //!
 //! | Constructor | Platform | When to use |
 //! |-------------|----------|-------------|
-//! | [`decoder::Decoder::open`] | all | default; lowest RSS (~9 MB) |
-//! | [`decoder::Decoder::open_hugepage_memfd`] | Linux ≥ 4.14 | max throughput, hugepages available |
-//! | [`decoder::Decoder::open_hugepage`] | Linux ≥ 2.6.17 | max throughput, hugepages available |
-//! | [`decoder::Decoder::from_mmap`] | all | caller controls mmap options |
+//! | [`decoder::Decoder::open_hugepage_memfd`] | Linux ≥ 4.14 | max throughput, hugepages reserved |
+//! | [`decoder::Decoder::open_hugepage`] | Linux ≥ 2.6.17 | max throughput, hugepages reserved |
+//! | [`decoder::Decoder::from_mmap`] | all | caller controls mmap options; portable file-mmap path |
 //! | [`decoder::Decoder::from_slice`] | all | caller controls backing memory |
 //!
-//! Both hugepage constructors fall back to [`decoder::Decoder::open`] transparently
-//! if `MAP_HUGETLB` is unavailable (no hugepages reserved or non-Linux platform).
+//! Hugepage constructors require pre-reserved 2 MiB pages (`vm.nr_hugepages`).
+//! If unavailable they return `io::ErrorKind::OutOfMemory` — there is no silent
+//! fallback.  Reserve with `sudo sysctl vm.nr_hugepages=N` before calling them.
+//!
+//! Non-Linux callers or callers that want a portable low-RSS path should build
+//! a [`memmap2::Mmap`] and pass it through [`decoder::Decoder::from_mmap`].
 //!
 //! # Quick start
 //!
 //! ```no_run
 //! use std::io::Read;
+//! use memmap2::MmapOptions;
 //! use mmapzstd::decoder::Decoder;
 //!
-//! let mut dec = Decoder::open(std::path::Path::new("data.zst"))?;
+//! // Linux — maximum throughput (requires vm.nr_hugepages > 0).
+//! #[cfg(target_os = "linux")]
+//! let mut dec = Decoder::open_hugepage_memfd(std::path::Path::new("data.zst"))?;
+//!
+//! // All platforms — portable file-mmap, low RSS (~9 MB sliding window).
+//! #[cfg(not(target_os = "linux"))]
+//! let mut dec = {
+//!     let file = std::fs::File::open("data.zst")?;
+//!     let mmap = unsafe { MmapOptions::new().map(&file)? };
+//!     Decoder::from_mmap(mmap)?
+//! };
+//!
 //! let mut out = Vec::new();
 //! dec.read_to_end(&mut out)?;
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
 //! # System requirements for hugepage variants
+//!
+//! Hugepage reservation is **mandatory** for `open_hugepage` and
+//! `open_hugepage_memfd` — failure returns a clear `OutOfMemory` error.
 //!
 //! ```sh
 //! # Reserve at least ⌈compressed_size_MiB / 2⌉ huge pages

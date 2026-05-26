@@ -74,5 +74,9 @@ fn main() {
     println!("throughput:   {:.1} MB/s", throughput_mb);
     println!("minor faults: {}", minflt_after - minflt_before);
     println!("major faults: {}", majflt_after - majflt_before);
-    println!("Peak RSS:     {} kB ({:.1} MB)", hwm_kb, hwm_kb as f64 / 1024.0);
+    println!(
+        "Peak RSS:     {} kB ({:.1} MB)",
+        hwm_kb,
+        hwm_kb as f64 / 1024.0
+    );
 }

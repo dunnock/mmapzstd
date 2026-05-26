@@ -22,7 +22,10 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| PathBuf::from(FIXTURE_DIR).join(FIXTURE_NAME));
 
     if !path.exists() {
-        eprintln!("Fixture not found at {}. Run gen_fixture first.", path.display());
+        eprintln!(
+            "Fixture not found at {}. Run gen_fixture first.",
+            path.display()
+        );
         std::process::exit(1);
     }
 
@@ -138,7 +141,10 @@ fn measure_h3b(path: &Path) {
 
     {
         let buf = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, compressed_len) };
-        File::open(path).expect("open").read_exact(buf).expect("read");
+        File::open(path)
+            .expect("open")
+            .read_exact(buf)
+            .expect("read");
     }
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, compressed_len) };
 
@@ -148,7 +154,11 @@ fn measure_h3b(path: &Path) {
     let elapsed = start.elapsed();
 
     let throughput = decompressed as f64 / elapsed.as_secs_f64() / 1024.0 / 1024.0;
-    println!("  decode: {:.2} ms  ({:.0} MB/s)", elapsed.as_secs_f64() * 1000.0, throughput);
+    println!(
+        "  decode: {:.2} ms  ({:.0} MB/s)",
+        elapsed.as_secs_f64() * 1000.0,
+        throughput
+    );
 
     unsafe { libc::munmap(ptr, aligned_len) };
     println!();
@@ -213,7 +223,10 @@ fn measure_h3c(path: &Path) {
 
     {
         let buf = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, compressed_len) };
-        File::open(path).expect("open").read_exact(buf).expect("read");
+        File::open(path)
+            .expect("open")
+            .read_exact(buf)
+            .expect("read");
     }
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, compressed_len) };
 
@@ -223,7 +236,11 @@ fn measure_h3c(path: &Path) {
     let elapsed = start.elapsed();
 
     let throughput = decompressed as f64 / elapsed.as_secs_f64() / 1024.0 / 1024.0;
-    println!("  decode: {:.2} ms  ({:.0} MB/s)", elapsed.as_secs_f64() * 1000.0, throughput);
+    println!(
+        "  decode: {:.2} ms  ({:.0} MB/s)",
+        elapsed.as_secs_f64() * 1000.0,
+        throughput
+    );
 
     unsafe { libc::munmap(ptr, aligned_len) };
     println!();

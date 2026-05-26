@@ -163,6 +163,13 @@ footprint and elimination of double-buffering may tip the balance.
 
 ---
 
+**Note (0.2.0):** `Decoder::open` was removed from the public API in 0.2.0 along with
+`MAP_POPULATE` / `MADV_POPULATE_READ`. The historical cycle-01/02/03 results above are
+preserved for context. The surviving entry points are `open_hugepage`, `open_hugepage_memfd`,
+`from_mmap`, and `from_slice`. See CHANGELOG for details.
+
+---
+
 ## Conclusion (cycle 04, updated)
 
 **Best end-to-end zstd decompression recipe on this hardware (i9-12900K, Linux 6.17, warm cache, hugepages available):**
@@ -170,7 +177,7 @@ footprint and elimination of double-buffering may tip the balance.
 ```rust
 // Linux with vm.nr_hugepages ≥ 1 — ~16% faster than BufReader baseline
 mmapzstd::decoder::Decoder::open_hugepage(path)?
-// Falls back to Decoder::open() automatically if MAP_HUGETLB is unavailable.
+// Returns OutOfMemory if MAP_HUGETLB fails (no silent fallback as of 0.2.0).
 ```
 
 Throughput: **~9,930 MB/s** mean across 4 runs (256 MiB corpus, zstd level 3).
@@ -217,7 +224,8 @@ hot in L1 dTLB — it is not the TLB bottleneck. The input scan over 128 MiB is.
 The mmap path with `MADV_DONTNEED` retirement retains its **memory-pressure** advantage:
 RSS stays at ~9 MB during decode vs. ~133 MB for the hugepage copy-in approach (which
 holds the full compressed file in memory). For files larger than available RAM, or when
-RSS matters more than throughput, `Decoder::open()` remains the right choice.
+RSS matters more than throughput, use `Decoder::from_mmap` with a caller-built
+`memmap2::Mmap` (the portable successor to the removed `Decoder::open`).
 
 ## Conclusion (cycle 02, historical)
 
