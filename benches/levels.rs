@@ -7,12 +7,13 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::RngCore;
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const FIXTURE_DIR: &str = "/work/cargo-target-ralph/mmapzstd-fixtures";
 const DECOMPRESSED_SIZE: u64 = 256 * 1024 * 1024;
+const GIB_DECOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 const HUGEPAGE: usize = 2 * 1024 * 1024;
@@ -173,6 +174,83 @@ fn ensure_fixtures() -> (PathBuf, PathBuf) {
     (l3, l9)
 }
 
+fn ensure_1gib_fixture() -> PathBuf {
+    std::fs::create_dir_all(FIXTURE_DIR).expect("create fixtures dir");
+    let path = PathBuf::from(FIXTURE_DIR).join("levels_1gib_l3.zst");
+    if path.exists() {
+        let sz = path.metadata().expect("stat 1gib").len();
+        eprintln!(
+            "1GiB fixture: {} bytes ({:.1} MiB compressed)",
+            sz,
+            sz as f64 / 1_048_576.0
+        );
+        return path;
+    }
+    eprintln!("Generating ≥1 GiB corpus (once — 2 GiB decompressed)...");
+    const BLOCK: usize = 4096;
+    const TOTAL: usize = 2 * 1024 * 1024 * 1024;
+    const CHUNK: usize = 4 * 1024 * 1024;
+
+    let mut rng = rand::thread_rng();
+    let file = std::fs::File::create(&path).expect("create 1gib fixture");
+    let mut encoder = zstd::stream::Encoder::new(file, 3).expect("zstd encoder");
+
+    let mut buf = vec![0u8; CHUNK];
+    let mut generated = 0usize;
+    while generated < TOTAL {
+        let chunk_len = CHUNK.min(TOTAL - generated);
+        let mut offset = 0;
+        while offset < chunk_len {
+            let end = (offset + BLOCK).min(chunk_len);
+            rng.fill_bytes(&mut buf[offset..end]);
+            offset = end;
+            let end = (offset + BLOCK).min(chunk_len);
+            for b in &mut buf[offset..end] {
+                *b = 0xAB;
+            }
+            offset = end;
+        }
+        encoder.write_all(&buf[..chunk_len]).expect("encode chunk");
+        generated += chunk_len;
+        if generated % (256 * 1024 * 1024) == 0 {
+            eprintln!("  ...{}/{} MiB", generated >> 20, TOTAL >> 20);
+        }
+    }
+    encoder.finish().expect("finish encoder");
+
+    let sz = path.metadata().expect("stat 1gib").len();
+    eprintln!(
+        "  1GiB corpus: {} bytes ({:.1} MiB compressed, from {} MiB decompressed)",
+        sz,
+        sz as f64 / 1_048_576.0,
+        TOTAL >> 20
+    );
+    path
+}
+
+/// Sum Private_Hugetlb and AnonHugePages across all VMAs (KiB).
+fn smaps_hugepage_totals() -> (u64, u64) {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
+    let mut private_hugetlb = 0u64;
+    let mut anon_huge = 0u64;
+    for line in smaps.lines() {
+        if let Some(rest) = line.strip_prefix("Private_Hugetlb:") {
+            private_hugetlb += rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("AnonHugePages:") {
+            anon_huge += rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    (private_hugetlb, anon_huge)
+}
+
 // ------ Linux hugepage helpers ------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -326,6 +404,83 @@ fn print_one_shot_stats(l3: &Path, l9: &Path) {
                 }
             }
         }
+
+        // hugepage-streaming-8m
+        #[cfg(target_os = "linux")]
+        {
+            const WINDOW: usize = 8 * 1024 * 1024;
+            let (hp_priv_before, hp_anon_before) = smaps_hugepage_totals();
+            let s0 = ProcSnapshot::now();
+            match mmapzstd::decoder::Decoder::open_hugepage_streaming(path, WINDOW) {
+                Err(e) => {
+                    eprintln!("hugepage-streaming-8m/{lname}: SKIPPED ({e})");
+                }
+                Ok(mut dec) => {
+                    let (hp_priv_open, hp_anon_open) = smaps_hugepage_totals();
+                    let scratch_kib = (hp_priv_open + hp_anon_open)
+                        .saturating_sub(hp_priv_before + hp_anon_before);
+                    io::copy(&mut dec, &mut io::sink()).expect("copy");
+                    let s1 = ProcSnapshot::now();
+                    let (mf, rss) = s1.delta(&s0);
+                    eprintln!(
+                        "hugepage-streaming-8m/{lname}: minflt={mf:+}  vmrss_delta={rss:+} KiB  \
+                         scratch_hugepages={scratch_kib} KiB"
+                    );
+                }
+            }
+        }
+    }
+    eprintln!();
+}
+
+fn print_1gib_stats(gib: &Path) {
+    eprintln!("\n=== 1 GiB one-shot proc stats (warm cache) ===");
+
+    // bufreader-64k
+    {
+        let s0 = ProcSnapshot::now();
+        let f = File::open(gib).expect("open");
+        let mut dec =
+            zstd::stream::Decoder::new(BufReader::with_capacity(65536, f)).expect("dec");
+        io::copy(&mut dec, &mut io::sink()).expect("copy");
+        let s1 = ProcSnapshot::now();
+        let (mf, rss) = s1.delta(&s0);
+        eprintln!("bufreader-64k/1gib: minflt={mf:+}  vmrss_delta={rss:+} KiB");
+    }
+
+    // mmap
+    {
+        let s0 = ProcSnapshot::now();
+        let file = File::open(gib).expect("open");
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("mmap") };
+        let mut dec = mmapzstd::decoder::Decoder::from_mmap(mmap).expect("from_mmap");
+        io::copy(&mut dec, &mut io::sink()).expect("copy");
+        let s1 = ProcSnapshot::now();
+        let (mf, rss) = s1.delta(&s0);
+        eprintln!("mmap/1gib: minflt={mf:+}  vmrss_delta={rss:+} KiB");
+    }
+
+    // hugepage-streaming-8m
+    #[cfg(target_os = "linux")]
+    {
+        const WINDOW: usize = 8 * 1024 * 1024;
+        let (hp_priv_before, hp_anon_before) = smaps_hugepage_totals();
+        let s0 = ProcSnapshot::now();
+        match mmapzstd::decoder::Decoder::open_hugepage_streaming(gib, WINDOW) {
+            Err(e) => eprintln!("hugepage-streaming-8m/1gib: SKIPPED ({e})"),
+            Ok(mut dec) => {
+                let (hp_priv_open, hp_anon_open) = smaps_hugepage_totals();
+                let scratch_kib = (hp_priv_open + hp_anon_open)
+                    .saturating_sub(hp_priv_before + hp_anon_before);
+                io::copy(&mut dec, &mut io::sink()).expect("copy");
+                let s1 = ProcSnapshot::now();
+                let (mf, rss) = s1.delta(&s0);
+                eprintln!(
+                    "hugepage-streaming-8m/1gib: minflt={mf:+}  vmrss_delta={rss:+} KiB  \
+                     scratch_hugepages={scratch_kib} KiB"
+                );
+            }
+        }
     }
     eprintln!();
 }
@@ -334,9 +489,11 @@ fn print_one_shot_stats(l3: &Path, l9: &Path) {
 
 fn bench_all(c: &mut Criterion) {
     let (l3, l9) = ensure_fixtures();
+    let gib = ensure_1gib_fixture();
 
     let l3_size = l3.metadata().expect("stat l3").len();
     let l9_size = l9.metadata().expect("stat l9").len();
+    let gib_size = gib.metadata().expect("stat gib").len();
     eprintln!("\n=== fixture sizes ===");
     eprintln!(
         "L3: {} bytes = {:.1} MiB  (ratio {:.2}:1)",
@@ -350,8 +507,14 @@ fn bench_all(c: &mut Criterion) {
         l9_size as f64 / 1_048_576.0,
         268_435_456.0 / l9_size as f64
     );
+    eprintln!(
+        "1GiB: {} bytes = {:.1} MiB compressed  (decompressed = 2048 MiB, ratio {:.2}:1)",
+        gib_size,
+        gib_size as f64 / 1_048_576.0,
+        GIB_DECOMPRESSED_SIZE as f64 / gib_size as f64
+    );
 
-    // Warm page cache for both fixtures before any measurements
+    // Warm page cache for 256 MiB fixtures before any measurements
     for path in [l3.as_path(), l9.as_path()] {
         let file = File::open(path).expect("warm mmap open");
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("warm mmap") };
@@ -363,7 +526,20 @@ fn bench_all(c: &mut Criterion) {
         io::copy(&mut dec, &mut io::sink()).expect("warm br copy");
     }
 
+    // Warm page cache for 1 GiB fixture
+    {
+        let file = File::open(&gib).expect("warm gib mmap open");
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("warm gib mmap") };
+        let mut dec = mmapzstd::decoder::Decoder::from_mmap(mmap).expect("warm gib dec");
+        io::copy(&mut dec, &mut io::sink()).expect("warm gib mmap copy");
+        let f = File::open(&gib).expect("warm gib br open");
+        let mut dec =
+            zstd::stream::Decoder::new(BufReader::with_capacity(65536, f)).expect("warm gib br dec");
+        io::copy(&mut dec, &mut io::sink()).expect("warm gib br copy");
+    }
+
     print_one_shot_stats(&l3, &l9);
+    print_1gib_stats(&gib);
 
     // ---- bufreader-64k -------------------------------------------------------
     {
@@ -500,6 +676,101 @@ fn bench_all(c: &mut Criterion) {
         if let Some((ptr, aligned)) = l9_mf {
             unsafe { libc::munmap(ptr, aligned) };
         }
+    }
+
+    // ---- hugepage-streaming-8m (256 MiB) -------------------------------------
+    #[cfg(target_os = "linux")]
+    {
+        const STREAMING_WINDOW: usize = 8 * 1024 * 1024;
+        let mut group = c.benchmark_group("hugepage-streaming-8m");
+        group.sample_size(10);
+        group.warm_up_time(Duration::from_secs(3));
+        group.measurement_time(Duration::from_secs(20));
+        group.throughput(Throughput::Bytes(DECOMPRESSED_SIZE));
+        for (name, path) in [("level3", l3.as_path()), ("level9", l9.as_path())] {
+            group.bench_with_input(BenchmarkId::from_parameter(name), path, |b, p| {
+                b.iter(|| {
+                    let mut dec =
+                        mmapzstd::decoder::Decoder::open_hugepage_streaming(p, STREAMING_WINDOW)
+                            .expect("open_hugepage_streaming");
+                    io::copy(&mut dec, &mut io::sink()).expect("copy");
+                });
+            });
+        }
+        group.finish();
+    }
+
+    // ---- 1 GiB corpus benchmarks ---------------------------------------------
+
+    // bufreader-64k-1gib
+    {
+        let mut group = c.benchmark_group("bufreader-64k-1gib");
+        group.sample_size(10);
+        group.warm_up_time(Duration::from_secs(3));
+        group.measurement_time(Duration::from_secs(30));
+        group.throughput(Throughput::Bytes(GIB_DECOMPRESSED_SIZE));
+        group.bench_with_input(
+            BenchmarkId::from_parameter("level3"),
+            gib.as_path(),
+            |b, p| {
+                b.iter(|| {
+                    let f = File::open(p).expect("open");
+                    let mut dec =
+                        zstd::stream::Decoder::new(BufReader::with_capacity(65536, f))
+                            .expect("dec");
+                    io::copy(&mut dec, &mut io::sink()).expect("copy");
+                });
+            },
+        );
+        group.finish();
+    }
+
+    // mmap-1gib
+    {
+        let mut group = c.benchmark_group("mmap-1gib");
+        group.sample_size(10);
+        group.warm_up_time(Duration::from_secs(3));
+        group.measurement_time(Duration::from_secs(30));
+        group.throughput(Throughput::Bytes(GIB_DECOMPRESSED_SIZE));
+        group.bench_with_input(
+            BenchmarkId::from_parameter("level3"),
+            gib.as_path(),
+            |b, p| {
+                b.iter(|| {
+                    let file = File::open(p).expect("open");
+                    let mmap =
+                        unsafe { memmap2::MmapOptions::new().map(&file).expect("mmap") };
+                    let mut dec =
+                        mmapzstd::decoder::Decoder::from_mmap(mmap).expect("from_mmap");
+                    io::copy(&mut dec, &mut io::sink()).expect("copy");
+                });
+            },
+        );
+        group.finish();
+    }
+
+    // hugepage-streaming-8m-1gib
+    #[cfg(target_os = "linux")]
+    {
+        const STREAMING_WINDOW: usize = 8 * 1024 * 1024;
+        let mut group = c.benchmark_group("hugepage-streaming-8m-1gib");
+        group.sample_size(10);
+        group.warm_up_time(Duration::from_secs(3));
+        group.measurement_time(Duration::from_secs(30));
+        group.throughput(Throughput::Bytes(GIB_DECOMPRESSED_SIZE));
+        group.bench_with_input(
+            BenchmarkId::from_parameter("level3"),
+            gib.as_path(),
+            |b, p| {
+                b.iter(|| {
+                    let mut dec =
+                        mmapzstd::decoder::Decoder::open_hugepage_streaming(p, STREAMING_WINDOW)
+                            .expect("open_hugepage_streaming");
+                    io::copy(&mut dec, &mut io::sink()).expect("copy");
+                });
+            },
+        );
+        group.finish();
     }
 }
 
