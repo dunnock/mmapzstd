@@ -264,17 +264,19 @@ fn print_one_shot_stats(l3: &Path, l9: &Path) {
             eprintln!("bufreader-64k/{lname}:  minflt={mf:+}  vmrss_delta={rss:+} KiB");
         }
 
-        // mmap-populate
+        // mmap (file-backed)
         {
             let s0 = ProcSnapshot::now();
-            let mut dec = mmapzstd::decoder::Decoder::open(path).expect("open");
+            let file = File::open(path).expect("open file");
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("mmap") };
+            let mut dec = mmapzstd::decoder::Decoder::from_mmap(mmap).expect("from_mmap");
             // Read smaps while the mmap is still live (before io::copy drops pages)
             let sm = smaps_for_file(path);
             io::copy(&mut dec, &mut io::sink()).expect("copy");
             let s1 = ProcSnapshot::now();
             let (mf, rss) = s1.delta(&s0);
-            eprintln!("mmap-populate/{lname}:  minflt={mf:+}  vmrss_delta={rss:+} KiB");
-            eprintln!("  smaps[mmap-populate/{lname}]: {sm}");
+            eprintln!("mmap/{lname}:  minflt={mf:+}  vmrss_delta={rss:+} KiB");
+            eprintln!("  smaps[mmap/{lname}]: {sm}");
         }
 
         // hugepage-anon
@@ -351,7 +353,9 @@ fn bench_all(c: &mut Criterion) {
 
     // Warm page cache for both fixtures before any measurements
     for path in [l3.as_path(), l9.as_path()] {
-        let mut dec = mmapzstd::decoder::Decoder::open(path).expect("warm mmap");
+        let file = File::open(path).expect("warm mmap open");
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("warm mmap") };
+        let mut dec = mmapzstd::decoder::Decoder::from_mmap(mmap).expect("warm mmap dec");
         io::copy(&mut dec, &mut io::sink()).expect("warm mmap copy");
         let f = File::open(path).expect("warm br open");
         let mut dec =
@@ -383,7 +387,7 @@ fn bench_all(c: &mut Criterion) {
 
     // ---- mmap-populate -------------------------------------------------------
     {
-        let mut group = c.benchmark_group("mmap-populate");
+        let mut group = c.benchmark_group("mmap");
         group.sample_size(10);
         group.warm_up_time(Duration::from_secs(3));
         group.measurement_time(Duration::from_secs(20));
@@ -391,7 +395,9 @@ fn bench_all(c: &mut Criterion) {
         for (name, path) in [("level3", l3.as_path()), ("level9", l9.as_path())] {
             group.bench_with_input(BenchmarkId::from_parameter(name), path, |b, p| {
                 b.iter(|| {
-                    let mut dec = mmapzstd::decoder::Decoder::open(p).expect("open");
+                    let file = File::open(p).expect("open");
+                    let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("mmap") };
+                    let mut dec = mmapzstd::decoder::Decoder::from_mmap(mmap).expect("from_mmap");
                     io::copy(&mut dec, &mut io::sink()).expect("copy");
                 });
             });

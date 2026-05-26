@@ -15,9 +15,9 @@ The fix is to place the compressed input on 2 MiB huge pages before decoding. `M
 | Mode | Constructor | Throughput (MB/s) | dRSS | Notes |
 |------|-------------|------------------:|-----:|-------|
 | naive BufReader | `zstd+BufReader<64 KiB>` | **8,634** | 5 MB | portable baseline |
-| naive file mmap | `Decoder::open` (cycle 01) | 6,597 | 9 MB | −24%; overflow-copy overhead + TLB pressure |
-| file mmap H1+H2 | `Decoder::open` (cycle 02) | 8,215 | 9 MB | −5%; eliminated overflow copy, MAP_POPULATE |
-| file mmap + MADV_HUGEPAGE | `Decoder::open` (cycle 03) | 8,076 | 9 MB | no change; THPeligible=0 for file VMA |
+| naive file mmap | `(removed — see CHANGELOG)` (cycle 01) | 6,597 | 9 MB | −24%; overflow-copy overhead + TLB pressure |
+| file mmap H1+H2 | `(removed — see CHANGELOG)` (cycle 02) | 8,215 | 9 MB | −5%; eliminated overflow copy, MAP_POPULATE |
+| file mmap + MADV_HUGEPAGE | `(removed — see CHANGELOG)` (cycle 03) | 8,076 | 9 MB | no change; THPeligible=0 for file VMA |
 | hugepage-anon (H3b) | `Decoder::open_hugepage` | **9,910** | ~133 MB | **+15%**; MAP_HUGETLB anon copy-in |
 | hugepage-memfd (H3c) | `Decoder::open_hugepage_memfd` | **9,944** | ~133 MB | **+15%**; memfd direct read, fewer faults |
 
@@ -36,17 +36,14 @@ On the highly-compressible (8.5:1) BTCUSD data, decode CPU dominates over TLB ef
 **Naive BufReader** — the portable baseline.  
 Reads compressed input in 64 KiB chunks; the kernel's sequential read-ahead keeps the pipe full. The 64 KiB size is L2-cache-optimal on the i9-12900K: it fits alongside the zstd streaming state inside the 1.25 MiB P-core L2. Larger buffers (256 KiB – 4 MiB) evict zstd's hot working set and lose 6–10%.
 
-**Naive file mmap** (`Decoder::open`) — low RSS, all platforms.  
-Memory-maps the compressed file read-only with `MAP_POPULATE` (batch pre-fault at open time) and `MADV_SEQUENTIAL + MADV_HUGEPAGE`. A 4 MiB sliding `MADV_DONTNEED` window retires pages behind the decode cursor, keeping RSS at ~9 MB regardless of file size. Best for memory-pressure workloads or files that exceed available RAM. On warm cache, ~5% slower than BufReader after two cycles of optimisation.
-
-**File mmap + MAP_POPULATE/MADV_HUGEPAGE** (cycle 02 winner before hugepage reservation) — same API as `Decoder::open`.  
-`MAP_POPULATE` moves 2,043 minor faults from the decode loop to open time. `MADV_HUGEPAGE` on a read-only file-backed `MAP_PRIVATE` VMA is silently ignored in Linux 6.17 (`THPeligible: 0`). TLB pressure during the decode scan remains unchanged.
+**Portable file mmap** (`Decoder::from_mmap`) — low RSS, all platforms.  
+Build a `memmap2::Mmap` yourself and pass it to `Decoder::from_mmap`. Applies `MADV_SEQUENTIAL + MADV_HUGEPAGE`. A 4 MiB sliding `MADV_DONTNEED` window retires pages behind the decode cursor, keeping RSS at ~9 MB regardless of file size. Best for memory-pressure workloads or files that exceed available RAM. On warm cache, ~5% slower than BufReader.
 
 **Hugepage anon copy-in (H3b)** (`Decoder::open_hugepage`) — maximum throughput, requires hugepages.  
-Reads the compressed file into a `Vec`, then copies it into a `MAP_HUGETLB | MAP_HUGE_2MB` anonymous buffer. Decodes from the hugepage region. Falls back transparently to `Decoder::open` if `mmap(MAP_HUGETLB)` returns `ENOMEM`. The copy-in incurs ~55k minor faults per open (one per 4 KiB write into the fresh anonymous mapping).
+Reads the compressed file into a `Vec`, then copies it into a `MAP_HUGETLB | MAP_HUGE_2MB` anonymous buffer. Decodes from the hugepage region. Returns `io::ErrorKind::OutOfMemory` if `mmap(MAP_HUGETLB)` fails — no silent fallback. The copy-in incurs ~55k minor faults per open (one per 4 KiB write into the fresh anonymous mapping).
 
 **Hugepage memfd copy-in (H3c)** (`Decoder::open_hugepage_memfd`) — maximum throughput, fewer faults.  
-Allocates a `memfd_create(MFD_HUGETLB | MFD_HUGE_2MB)` file descriptor, maps it, and reads the compressed file directly into the mapped region—no intermediate `Vec`. Fault count drops to ~107 per open (vs ~55k for H3b). Marginally faster than H3b; preferred when hugepages are available.
+Allocates a `memfd_create(MFD_HUGETLB | MFD_HUGE_2MB)` file descriptor, maps it, and reads the compressed file directly into the mapped region—no intermediate `Vec`. Fault count drops to ~107 per open (vs ~55k for H3b). Marginally faster than H3b; preferred when hugepages are available. Returns `io::ErrorKind::OutOfMemory` if hugepage allocation fails.
 
 ## Library usage
 
@@ -54,6 +51,7 @@ Allocates a `memfd_create(MFD_HUGETLB | MFD_HUGE_2MB)` file descriptor, maps it,
 # Cargo.toml
 [dependencies]
 mmapzstd = { git = "https://github.com/dunnock/mmapzstd" }
+memmap2 = "0.9"   # for from_mmap on non-Linux
 ```
 
 ```rust
@@ -62,13 +60,19 @@ use mmapzstd::decoder::Decoder;
 
 fn decompress(path: &std::path::Path) -> io::Result<Vec<u8>> {
     // Maximum throughput on Linux with vm.nr_hugepages reserved.
-    // Falls back to Decoder::open automatically if hugepages are unavailable.
+    // Returns io::ErrorKind::OutOfMemory if hugepages are unavailable —
+    // reserve with `sudo sysctl vm.nr_hugepages=N` before calling.
     #[cfg(target_os = "linux")]
     let mut dec = Decoder::open_hugepage_memfd(path)?;
 
-    // Portable: mmap with MAP_POPULATE + MADV_SEQUENTIAL. Low RSS.
+    // Non-Linux: build a Mmap yourself and pass it through from_mmap.
+    // Applies MADV_SEQUENTIAL; keeps RSS at ~9 MB via DONTNEED retirement.
     #[cfg(not(target_os = "linux"))]
-    let mut dec = Decoder::open(path)?;
+    let mut dec = {
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Decoder::from_mmap(mmap)?
+    };
 
     let mut out = Vec::new();
     dec.read_to_end(&mut out)?;
@@ -77,10 +81,9 @@ fn decompress(path: &std::path::Path) -> io::Result<Vec<u8>> {
 ```
 
 Constructor guide:
-- **`open_hugepage_memfd(path)`** — Linux, hugepages reserved: maximum throughput, direct read, ~107 faults/open.
-- **`open_hugepage(path)`** — Linux, hugepages reserved: same throughput, ~55k faults/open (Vec copy-in).
-- **`open(path)`** — all platforms: lowest RSS (~9 MB); auto-fallback target for both hugepage variants.
-- **`from_mmap(mmap)`** — caller provides a pre-built `memmap2::Mmap`.
+- **`open_hugepage_memfd(path)`** — Linux ≥ 4.14, hugepages reserved: maximum throughput, direct read, ~107 faults/open.
+- **`open_hugepage(path)`** — Linux ≥ 2.6.17, hugepages reserved: same throughput, ~55k faults/open (Vec copy-in).
+- **`from_mmap(mmap)`** — all platforms: caller provides a pre-built `memmap2::Mmap`; portable low-RSS path.
 - **`from_slice(data)`** — caller manages backing memory (custom allocators, test stubs).
 
 All constructors return `io::Result<Decoder>` and implement `std::io::Read`.
@@ -135,7 +138,10 @@ grep HugePages /proc/meminfo
 # Hugepagesize:        2048 kB
 ```
 
-160 pages covers up to 320 MiB of compressed input. If hugepages are not reserved, both `open_hugepage` and `open_hugepage_memfd` fall back to `Decoder::open` transparently—no error, no panic, no API breakage.
+160 pages covers up to 320 MiB of compressed input. If hugepages are not reserved, both
+`open_hugepage` and `open_hugepage_memfd` return `io::ErrorKind::OutOfMemory` with a message
+explaining how to reserve hugepages. There is no silent fallback — hugepage reservation is
+mandatory for these constructors.
 
 ## Read the paper
 

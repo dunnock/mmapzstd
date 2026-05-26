@@ -117,6 +117,12 @@ Performance delta vs baseline: mmap 31.15 ms, baseline 29.67 ms — **mmap is 5%
 
 The remaining gap is TLB pressure: mmap accesses 32,768 distinct 4 KiB pages sequentially, while BufReader reuses the same 16 pages repeatedly (64 KiB buffer), keeping them hot in L1 dTLB.
 
+**Disposition (0.2.0):** `MAP_POPULATE` and `MADV_POPULATE_READ` were removed from the
+`apply_madvise()` implementation in 0.2.0 along with `Decoder::open`. The hugepage path
+(`open_hugepage`, `open_hugepage_memfd`) has no caller for this optimisation — the
+`read()`-into-memfd step faults pages as part of its essential work, and the measured
+contribution was ~0.5% wall time, well below criterion noise.
+
 ---
 
 ## Hypothesis 3: `MAP_HUGETLB` / Transparent Huge Pages — Collapse TLB Entries

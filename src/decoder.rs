@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::Mmap;
 use zstd::stream::raw::{Decoder as ZstdDecoder, Operation};
 
 /// Owned buffer backed by a 2 MiB `MAP_HUGETLB` anonymous mapping.
@@ -60,7 +60,7 @@ impl std::ops::Deref for DecoderBuf<'_> {
 ///
 /// # Lifetime
 ///
-/// `Decoder<'static>` owns its backing buffer (constructed via [`open`][Self::open],
+/// `Decoder<'static>` owns its backing buffer (constructed via
 /// [`from_mmap`][Self::from_mmap], [`open_hugepage`][Self::open_hugepage], or
 /// [`open_hugepage_memfd`][Self::open_hugepage_memfd]).
 ///
@@ -71,9 +71,12 @@ impl std::ops::Deref for DecoderBuf<'_> {
 ///
 /// ```no_run
 /// use std::io::Read;
+/// use memmap2::MmapOptions;
 /// use mmapzstd::decoder::Decoder;
 ///
-/// let mut dec = Decoder::open(std::path::Path::new("data.zst"))?;
+/// let file = std::fs::File::open("data.zst")?;
+/// let mmap = unsafe { MmapOptions::new().map(&file)? };
+/// let mut dec = Decoder::from_mmap(mmap)?;
 /// let mut out = Vec::new();
 /// dec.read_to_end(&mut out)?;
 /// # Ok::<(), std::io::Error>(())
@@ -86,39 +89,12 @@ pub struct Decoder<'a> {
 }
 
 impl Decoder<'static> {
-    /// Open `path` by memory-mapping the compressed file.
-    ///
-    /// Applies `MAP_POPULATE` (batch pre-fault), `MADV_SEQUENTIAL`, and
-    /// `MADV_HUGEPAGE` (Linux).  A 4 MiB sliding `MADV_DONTNEED` window retires
-    /// pages behind the decode cursor, keeping RSS at ~9 MB regardless of file size.
-    ///
-    /// This is the portable, low-RSS constructor.  On warm cache it is ~5% slower
-    /// than a 64 KiB `BufReader`; prefer [`open_hugepage_memfd`][Self::open_hugepage_memfd]
-    /// when Linux hugepages are available.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use mmapzstd::decoder::Decoder;
-    ///
-    /// let dec = Decoder::open(std::path::Path::new("data.zst"))?;
-    /// # Ok::<(), std::io::Error>(())
-    /// ```
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        // SAFETY: the file is opened read-only and we do not mutate it.
-        // MAP_POPULATE pre-faults all pages at mmap time so fault overhead
-        // is paid once in batch rather than scattered across the decode loop.
-        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
-        Self::from_mmap(mmap)
-    }
-
     /// Take ownership of a pre-built [`Mmap`] and prepare the zstd stream.
     ///
-    /// Applies `MADV_SEQUENTIAL`, `MADV_HUGEPAGE` (Linux), and
-    /// `MADV_POPULATE_READ` (Linux ≥ 5.14) hints.  Use this when you need
-    /// fine-grained control over mmap options (e.g., to map a specific file
-    /// offset or apply custom flags before handing the mapping to the decoder).
+    /// Applies `MADV_SEQUENTIAL` and `MADV_HUGEPAGE` (Linux) hints.  Use this
+    /// when you need fine-grained control over mmap options (e.g., to map a
+    /// specific file offset or apply custom flags before handing the mapping to
+    /// the decoder).
     ///
     /// # Example
     ///
@@ -151,17 +127,15 @@ impl Decoder<'static> {
     /// approximately +15% throughput over the BufReader baseline on warm-cache
     /// sequential reads (i9-12900K, Linux 6.17, 128 MiB compressed input).
     ///
-    /// Falls back to [`open`][Self::open] transparently if `mmap(MAP_HUGETLB)`
-    /// fails (no hugepages reserved, or non-Linux platform).
-    ///
     /// Requires `vm.nr_hugepages >= ceil(compressed_size_bytes / 2_MiB)`.
+    /// Returns `io::ErrorKind::OutOfMemory` if `MAP_HUGETLB` fails — reserve
+    /// hugepages with `sudo sysctl vm.nr_hugepages=N` first.
     ///
     /// # Example
     ///
     /// ```no_run
     /// use mmapzstd::decoder::Decoder;
     ///
-    /// // Linux with hugepages reserved; falls back to Decoder::open otherwise.
     /// let dec = Decoder::open_hugepage(std::path::Path::new("data.zst"))?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
@@ -186,7 +160,16 @@ impl Decoder<'static> {
         };
 
         if ptr == libc::MAP_FAILED {
-            return Self::open(path);
+            let free = read_hugepages_free().unwrap_or(0);
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "MAP_HUGETLB failed (HugePages_Free={}); \
+                     reserve hugepages with `sudo sysctl vm.nr_hugepages=N` \
+                     (see README §System requirements)",
+                    free,
+                ),
+            ));
         }
 
         let ptr = ptr as *mut u8;
@@ -213,10 +196,9 @@ impl Decoder<'static> {
     /// Throughput: ~9,944 MB/s on a 128 MiB compressed synthetic corpus
     /// (i9-12900K, Linux 6.17, warm cache, Criterion median over 4 runs).
     ///
-    /// Falls back to [`open`][Self::open] transparently if `memfd_create`,
-    /// `ftruncate`, or the subsequent `mmap` fails.
-    ///
     /// Requires `vm.nr_hugepages >= ceil(compressed_size_bytes / 2_MiB)`.
+    /// Returns `io::ErrorKind::OutOfMemory` if hugepage allocation fails — reserve
+    /// hugepages with `sudo sysctl vm.nr_hugepages=N` first.
     ///
     /// # Example
     ///
@@ -247,14 +229,24 @@ impl Decoder<'static> {
         };
 
         if fd < 0 {
-            return Self::open(path);
+            let free = read_hugepages_free().unwrap_or(0);
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "MAP_HUGETLB failed (HugePages_Free={}); \
+                     reserve hugepages with `sudo sysctl vm.nr_hugepages=N` \
+                     (see README §System requirements)",
+                    free,
+                ),
+            ));
         }
         let fd = fd as libc::c_int;
 
         let rc = unsafe { libc::ftruncate(fd, capacity as libc::off_t) };
         if rc != 0 {
+            let err = io::Error::last_os_error();
             unsafe { libc::close(fd) };
-            return Self::open(path);
+            return Err(err);
         }
 
         let ptr = unsafe {
@@ -270,7 +262,16 @@ impl Decoder<'static> {
         unsafe { libc::close(fd) };
 
         if ptr == libc::MAP_FAILED {
-            return Self::open(path);
+            let free = read_hugepages_free().unwrap_or(0);
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "MAP_HUGETLB failed (HugePages_Free={}); \
+                     reserve hugepages with `sudo sysctl vm.nr_hugepages=N` \
+                     (see README §System requirements)",
+                    free,
+                ),
+            ));
         }
 
         let ptr = ptr as *mut u8;
@@ -388,23 +389,30 @@ fn apply_madvise(mmap: &Mmap) -> io::Result<()> {
         use memmap2::Advice;
         mmap.advise(Advice::Sequential)?;
         #[cfg(target_os = "linux")]
-        {
-            mmap.advise(Advice::HugePage)?;
-            // Pre-fault all page-table entries in batch so that minor faults
-            // are paid once here rather than scattered across the decode loop.
-            // Also benefits callers that use from_mmap() where MAP_POPULATE
-            // was not set at creation time. Silently ignored on < 5.14 kernels.
-            let _ = mmap.advise(Advice::PopulateRead);
-        }
+        mmap.advise(Advice::HugePage)?;
     }
     #[cfg(not(unix))]
     let _ = mmap;
     Ok(())
 }
 
+/// Parse `HugePages_Free` from `/proc/meminfo`. Best-effort; returns `None` on any parse failure.
+#[cfg(target_os = "linux")]
+fn read_hugepages_free() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("HugePages_Free:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memmap2::MmapOptions;
     use std::io::{Read, Write};
 
     fn compressed_tempfile(data: &[u8]) -> tempfile::NamedTempFile {
@@ -414,12 +422,18 @@ mod tests {
         f
     }
 
+    fn open_via_mmap(path: &std::path::Path) -> Decoder<'static> {
+        let file = std::fs::File::open(path).expect("open");
+        let mmap = unsafe { MmapOptions::new().map(&file).expect("mmap") };
+        Decoder::from_mmap(mmap).expect("from_mmap")
+    }
+
     #[test]
-    fn round_trip() {
+    fn round_trip_from_mmap() {
         let data: Vec<u8> = (0u16..1024).map(|i| (i % 251) as u8).collect();
         let f = compressed_tempfile(&data);
 
-        let mut dec = Decoder::open(f.path()).expect("open");
+        let mut dec = open_via_mmap(f.path());
         let mut got = Vec::new();
         dec.read_to_end(&mut got).expect("read_to_end");
 
@@ -456,7 +470,7 @@ mod tests {
         use std::io::Write;
         tmp.write_all(&compressed).expect("write");
 
-        let mut dec = Decoder::open(tmp.path()).expect("open");
+        let mut dec = open_via_mmap(tmp.path());
         let mut got = Vec::with_capacity(data.len());
         dec.read_to_end(&mut got).expect("read_to_end");
         assert_eq!(got, data);
@@ -499,7 +513,7 @@ mod tests {
         let data: Vec<u8> = (0u16..4096).map(|i| (i % 199) as u8).collect();
         let f = compressed_tempfile(&data);
 
-        let mut dec = Decoder::open(f.path()).expect("open");
+        let mut dec = open_via_mmap(f.path());
         let mut got = Vec::with_capacity(data.len());
         let mut one = [0u8; 1];
         loop {
@@ -510,5 +524,37 @@ mod tests {
         }
 
         assert_eq!(got, data);
+    }
+
+    /// Verifies that `open_hugepage` returns `OutOfMemory` when `MAP_HUGETLB` fails
+    /// rather than silently falling back to a file mmap.
+    ///
+    /// Requires `HugePages_Free == 0` to exercise the error path.
+    /// On systems with hugepages reserved (e.g., `vm.nr_hugepages=160`), this test
+    /// is a no-op — run `sudo sysctl vm.nr_hugepages=0` to enable it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_hugepage_returns_oom_when_no_hugepages() {
+        let free = read_hugepages_free().unwrap_or(0);
+        if free > 0 {
+            // Cannot trigger MAP_HUGETLB failure with hugepages available.
+            // Set vm.nr_hugepages=0 to enable this test.
+            return;
+        }
+
+        let data = zstd::encode_all(b"hello".as_ref(), 0).unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&data).unwrap();
+
+        let result = Decoder::open_hugepage(f.path());
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected OutOfMemory error when hugepages unavailable"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(
+            err.to_string().contains("MAP_HUGETLB failed"),
+            "unexpected error: {err}"
+        );
     }
 }

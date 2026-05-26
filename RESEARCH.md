@@ -494,8 +494,35 @@ full input into hugepage memory up front.
 
 3. *Mixed-size file workloads.* Benchmark a stream of many small files (< 2 MiB each)
    where hugepage allocation overhead per file dominates.  The optimal strategy may be
-   to use `Decoder::open` for small files and `Decoder::open_hugepage_memfd` for files
-   above a threshold (e.g., 8 MiB).
+   to use `Decoder::from_mmap` for small files and `Decoder::open_hugepage_memfd` for
+   files above a threshold (e.g., 8 MiB).
+
+---
+
+## 9. API simplification (0.2.0)
+
+Based on the measured results above, two API surface reductions were applied in version
+0.2.0:
+
+**`Decoder::open` removed.**  The cycle-02 file-mmap path (`Decoder::open`) was the
+original portable entry point, running at −5% vs BufReader after optimisation.  With
+`open_hugepage` and `open_hugepage_memfd` dominating at +15% and bounded callers handled
+by `from_mmap` / `from_slice`, the file-mmap opener became dead weight.  Callers who
+need a portable low-RSS file-mmap can build their own `memmap2::Mmap` and pass it
+through `Decoder::from_mmap`.
+
+**`MAP_POPULATE` / `MADV_POPULATE_READ` removed.**  These were the supporting
+optimisation for `Decoder::open` (H2, cycle 02 — batch pre-fault at open time).  With
+`open` gone, neither flag has a surviving caller.  On the hugepage path the
+`read()`-into-memfd step faults pages as an essential side effect of its work; the
+additional advise contributed ~0.5% wall time — well below criterion noise (~1%).
+Removing them simplifies `apply_madvise()` to `MADV_SEQUENTIAL + MADV_HUGEPAGE`.
+
+**Error contract change.**  The silent fallback (`if MAP_FAILED { return
+Self::open(path) }`) was replaced with an explicit `io::ErrorKind::OutOfMemory` error
+that names the failure and directs the operator to `sudo sysctl vm.nr_hugepages=N`.
+This makes misconfiguration immediately visible rather than silently degrading to the
+slower file-mmap path.
 
 ---
 
@@ -597,15 +624,17 @@ VmPTE:         256 kB    (~32,768 PTEs at 8 bytes each)
 
 ## Appendix B: Decoder API reference
 
-The library exposes a single public module, `mmapzstd::decoder`, containing:
+The library exposes a single public module, `mmapzstd::decoder`, containing
+(as of 0.2.0):
 
-| Constructor | Platform | Fallback | RSS profile |
-|------------|----------|----------|-------------|
-| `Decoder::open(path)` | all | — | ~9 MB sliding window |
-| `Decoder::from_mmap(mmap)` | all | — | caller-controlled |
-| `Decoder::from_slice(data)` | all | — | caller-controlled |
-| `Decoder::open_hugepage(path)` | Linux | `open` | full compressed file |
-| `Decoder::open_hugepage_memfd(path)` | Linux ≥ 4.14 | `open` | full compressed file |
+| Constructor | Platform | On failure | RSS profile |
+|------------|----------|------------|-------------|
+| `Decoder::from_mmap(mmap)` | all | `io::Error` | caller-controlled |
+| `Decoder::from_slice(data)` | all | `io::Error` | caller-controlled |
+| `Decoder::open_hugepage(path)` | Linux | `OutOfMemory` | full compressed file |
+| `Decoder::open_hugepage_memfd(path)` | Linux ≥ 4.14 | `OutOfMemory` | full compressed file |
+
+`Decoder::open(path)` was removed in 0.2.0; see §9.
 
 All constructors return `io::Result<Decoder>`.  `Decoder` implements `std::io::Read`;
 the caller drives the decode pace.  No internal thread is created; no bytes are

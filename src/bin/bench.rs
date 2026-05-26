@@ -86,9 +86,10 @@ fn open_reader_hugepage_anon(path: &std::path::Path) -> io::Result<Box<dyn Read>
         mmapzstd::decoder::Decoder::open_hugepage(path).map(|d| Box::new(d) as Box<dyn Read>)
     }
     #[cfg(not(target_os = "linux"))]
-    {
-        mmapzstd::decoder::Decoder::open(path).map(|d| Box::new(d) as Box<dyn Read>)
-    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "hugepage-anon requires Linux; use --mode bufreader on other platforms",
+    ))
 }
 
 fn open_reader_hugepage_memfd(path: &std::path::Path) -> io::Result<Box<dyn Read>> {
@@ -97,9 +98,10 @@ fn open_reader_hugepage_memfd(path: &std::path::Path) -> io::Result<Box<dyn Read
         mmapzstd::decoder::Decoder::open_hugepage_memfd(path).map(|d| Box::new(d) as Box<dyn Read>)
     }
     #[cfg(not(target_os = "linux"))]
-    {
-        mmapzstd::decoder::Decoder::open(path).map(|d| Box::new(d) as Box<dyn Read>)
-    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "hugepage-memfd requires Linux; use --mode bufreader on other platforms",
+    ))
 }
 
 fn open_reader_bufreader(path: &std::path::Path, buf_size: usize) -> io::Result<Box<dyn Read>> {
@@ -200,9 +202,15 @@ fn main() -> io::Result<()> {
         let needed = needed_hugepages(file_size);
         if free < needed {
             eprintln!(
-                "note: hugepage allocation failed (HugePages_Free={}), using fallback path",
-                free
+                "error: insufficient hugepages (HugePages_Free={}, need {}).",
+                free, needed
             );
+            eprintln!(
+                "  Reserve hugepages with: sudo sysctl vm.nr_hugepages={}",
+                needed
+            );
+            eprintln!("  See README §System requirements for details.");
+            std::process::exit(1);
         }
     }
 
